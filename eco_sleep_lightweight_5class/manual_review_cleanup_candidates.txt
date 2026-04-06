@@ -1,0 +1,3 @@
+src/eco_sleep/models/tiny_tcn.py : retained because ContextTinyTCN is still used by tiny_cnn1d.py and edf_snn.py
+src/eco_sleep/models/tiny_cnn1d.py : retained because EEGTinyEncoder is still used by EdfSNN import/self-check paths
+src/eco_sleep/models/edf_snn.py : retained as lightweight Sleep-EDF fallback and import-compatibility path

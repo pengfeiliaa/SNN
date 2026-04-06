@@ -1,0 +1,274 @@
+{
+  "generated_at": "2026-03-10T12:43:13",
+  "project_root": "E:\\papercode\\eco_sleep_lightweight_5class",
+  "config_path": "configs\\sleep_edf_5class.yaml",
+  "task": "sleep_edf_5class",
+  "num_classes": 5,
+  "default_model": "picosleepnet_baseline",
+  "raw_dir": "F:/论文/daima1/datasets/edf",
+  "processed_dir": "E:\\papercode\\eco_sleep_lightweight_5class\\data\\sleep_edf_20_processed",
+  "runs_dir": "E:/papercode/eco_sleep_lightweight_5class/runs",
+  "file_index": [
+    {
+      "group": "scripts",
+      "path": "scripts/preprocess_sleep_edf.py",
+      "exists": true,
+      "dependencies": [
+        "src/eco_sleep/data/sleep_edf/edf_reader.py",
+        "src/eco_sleep/data/sleep_edf/preprocessing.py",
+        "src/eco_sleep/data/sleep_edf/labels.py",
+        "src/eco_sleep/data/sleep_edf/storage.py"
+      ]
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/diagnose_data.py",
+      "exists": true,
+      "dependencies": [
+        "scripts/preprocess_sleep_edf.py",
+        "src/eco_sleep/data/sleep_edf/labels.py",
+        "src/eco_sleep/data/sleep_edf/splits.py"
+      ]
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/train_sleep_edf.py",
+      "exists": true,
+      "dependencies": [
+        "scripts/preprocess_sleep_edf.py",
+        "src/eco_sleep/data/sleep_edf/storage.py",
+        "src/eco_sleep/models/picosleepnet_baseline.py",
+        "src/eco_sleep/models/picosleepnet_plus_snn.py",
+        "src/eco_sleep/models/losses.py",
+        "src/eco_sleep/train/checkpoints.py",
+        "src/eco_sleep/train/evaluate.py"
+      ]
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/eval_sleep_edf.py",
+      "exists": true,
+      "dependencies": [
+        "scripts/preprocess_sleep_edf.py",
+        "src/eco_sleep/train/checkpoints.py",
+        "src/eco_sleep/train/evaluate.py",
+        "src/eco_sleep/utils/plots.py",
+        "src/eco_sleep/utils/bland_altman.py",
+        "src/eco_sleep/utils/model_complexity.py"
+      ]
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/run_all_sleep_edf.ps1",
+      "exists": true,
+      "dependencies": [
+        "scripts/compile_check.py",
+        "scripts/preprocess_sleep_edf.py",
+        "scripts/diagnose_data.py",
+        "scripts/train_sleep_edf.py",
+        "scripts/eval_sleep_edf.py"
+      ]
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/compile_check.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/quick_smoke.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "scripts",
+      "path": "scripts/audit_sleep_edf_pipeline.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/annotations.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/dataset.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/edf_reader.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/labels.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/preprocessing.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/splits.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "data_sleep_edf",
+      "path": "src/eco_sleep/data/sleep_edf/storage.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "models",
+      "path": "src/eco_sleep/models/__init__.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "models",
+      "path": "src/eco_sleep/models/picosleepnet_baseline.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "models",
+      "path": "src/eco_sleep/models/picosleepnet_plus_snn.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "models",
+      "path": "src/eco_sleep/models/losses.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "train_utils",
+      "path": "src/eco_sleep/train/checkpoints.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "train_utils",
+      "path": "src/eco_sleep/train/evaluate.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "train_utils",
+      "path": "src/eco_sleep/train/trainer.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "runtime_utils",
+      "path": "src/eco_sleep/utils/encoding_fix.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "runtime_utils",
+      "path": "src/eco_sleep/utils/io.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "runtime_utils",
+      "path": "src/eco_sleep/utils/model_complexity.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "runtime_utils",
+      "path": "src/eco_sleep/utils/plots.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "runtime_utils",
+      "path": "src/eco_sleep/utils/bland_altman.py",
+      "exists": true,
+      "dependencies": []
+    },
+    {
+      "group": "runtime_utils",
+      "path": "src/eco_sleep/utils/logger.py",
+      "exists": true,
+      "dependencies": []
+    }
+  ],
+  "risk_points": [
+    "processed npz 字段名与 dataset 读取不一致，例如 labels/label、raw_epoch、lcs_pos_count 等错配。",
+    "checkpoint 未保存 model_name/model_hparams/task/num_classes/split_id 时，eval 重建模型会发生 state_dict mismatch。",
+    "processed_dir 中旧缓存与当前预处理代码/关键配置混用，必须依赖 preprocess manifest 检出并阻止训练/评估。",
+    "标签映射来源不统一会导致 preprocess、diagnose、train、eval 的 num_classes 或 label range 不一致。",
+    "空 CSV、0 字节 CSV、只有表头的 CSV 如果直接 read_csv，审计脚本容易崩溃。",
+    "Windows 下 DataLoader 若偏离 num_workers=0、persistent_workers=False、pin_memory=True，容易引入卡死或行为漂移。",
+    "无 GPU 且 allow_cpu!=true 时，训练必须直接中文报错退出，不能静默退回 CPU。"
+  ],
+  "preprocess_cache_status": {
+    "reuse_available": false,
+    "reason": "manifest_missing",
+    "manifest_path": "E:\\papercode\\eco_sleep_lightweight_5class\\data\\sleep_edf_20_processed\\preprocess_manifest.json",
+    "fingerprint_hash": "20abda75b7949e91ee08543facaaadf28cc2fe202cafac46f70345cc711bab81"
+  },
+  "processed_records": {
+    "record_count": 39,
+    "record_ids": [
+      "SC4001E0",
+      "SC4002E0",
+      "SC4011E0",
+      "SC4012E0",
+      "SC4021E0",
+      "SC4022E0",
+      "SC4031E0",
+      "SC4032E0",
+      "SC4041E0",
+      "SC4042E0",
+      "SC4051E0",
+      "SC4052E0",
+      "SC4061E0",
+      "SC4062E0",
+      "SC4071E0",
+      "SC4072E0",
+      "SC4081E0",
+      "SC4082E0",
+      "SC4091E0",
+      "SC4092E0",
+      "SC4101E0",
+      "SC4102E0",
+      "SC4111E0",
+      "SC4112E0",
+      "SC4121E0",
+      "SC4122E0",
+      "SC4131E0",
+      "SC4141E0",
+      "SC4142E0",
+      "SC4151E0",
+      "SC4152E0",
+      "SC4161E0",
+      "SC4162E0",
+      "SC4171E0",
+      "SC4172E0",
+      "SC4181E0",
+      "SC4182E0",
+      "SC4191E0",
+      "SC4192E0"
+    ],
+    "legacy_record_count": 0,
+    "schema_versions": [
+      2
+    ]
+  }
+}
