@@ -43,6 +43,7 @@ from eco_sleep.models.losses import (
     build_loss,
     compute_class_prior,
     compute_class_weights,
+    logits_consistency_kl_loss,
     soft_target_cross_entropy,
     summarize_loss_setup,
     temporal_consistency_kl_loss,
@@ -57,6 +58,7 @@ from eco_sleep.train import (
 from eco_sleep.train.trainer import (
     ModelEMA,
     has_consecutive_effective_zeros,
+    loss_is_effectively_zero,
     named_gradient_summaries,
     named_parameter_summaries,
 )
@@ -97,11 +99,15 @@ REAL_STRATEGY_RECIPE = "real_strategy_logit_adjust_threshold"
 CONTEXT_PICO_RECIPE = "context_pico_v1"
 CONTEXT_PICO_LDAM_RECIPE = "context_pico_v1_ldam"
 CONTEXT_PICO_TC_RECIPE = "context_pico_v1_cb_focal_tc"
+CONTEXT_PICO_LDAM_DRW_RECIPE = "context_pico_v1_ldam_drw"
+CONTEXT_PICO_LDAM_DRW_EMA_RECIPE = "context_pico_v1_ldam_drw_ema"
+CONTEXT_PICO_LDAM_DRW_EMA_SELECT_RECIPE = "context_pico_v1_ldam_drw_ema_select"
+CONTEXT_PICO_TRAIN_TIME_OPT_RECIPE = "context_pico_v1_train_time_opt"
 CONTEXT_PICO_V2_CB_FOCAL_RECIPE = "context_pico_v2_cb_focal"
 CONTEXT_PICO_V2_LDAM_DRW_RECIPE = "context_pico_v2_ldam_drw"
 CONTEXT_PICO_V2_TC_RECIPE = "context_pico_v2_ldam_drw_tc"
 CONTEXT_PICO_V2_SHORT_CONTEXT_RECIPE = "context_pico_v2_ldam_drw_short_context"
-BASELINE_RUN_DIR = (ROOT / "runs" / "20260401_171526_sleep_edf").resolve()
+BASELINE_RUN_DIR = (ROOT / "runs" / "20260405_162343_sleep_edf_context_pico").resolve()
 ACTIVE_TOUCHED_FILES = [
     "scripts/train_sleep_edf.py",
     "scripts/eval_sleep_edf.py",
@@ -138,11 +144,18 @@ SAFE_RECIPE_CHOICES = [
     CONTEXT_PICO_RECIPE,
     CONTEXT_PICO_LDAM_RECIPE,
     CONTEXT_PICO_TC_RECIPE,
+    CONTEXT_PICO_LDAM_DRW_RECIPE,
+    CONTEXT_PICO_LDAM_DRW_EMA_RECIPE,
+    CONTEXT_PICO_LDAM_DRW_EMA_SELECT_RECIPE,
+    CONTEXT_PICO_TRAIN_TIME_OPT_RECIPE,
     CONTEXT_PICO_V2_CB_FOCAL_RECIPE,
     CONTEXT_PICO_V2_LDAM_DRW_RECIPE,
     CONTEXT_PICO_V2_TC_RECIPE,
     CONTEXT_PICO_V2_SHORT_CONTEXT_RECIPE,
 ]
+
+MACRO_N1_REM_GUARDED_CKPT_RULE = "macro_f1_n1_rem_guarded"
+MACRO_N1_REM_GUARDED_SCORE_FORMULA = "0.60*val_macro_f1+0.20*val_N1_f1+0.10*val_kappa+0.10*val_REM_f1"
 
 
 def _to_bool(value: object) -> bool:
@@ -230,8 +243,13 @@ def _write_active_method_report(
         "distillation_enabled": bool(_to_bool(train_cfg.get("distillation_enable", False))),
         "learnable_tau_enabled": bool(_to_bool(train_cfg.get("learnable_tau", False))),
         "learnable_threshold_enabled": bool(_to_bool(getattr(model, "learnable_threshold", False))),
-        "best_ckpt_metric_name": "val_macro_f1_then_kappa_then_n1_f1_then_n1_recall",
-        "best_ckpt_selection_rule": "eligible if val_N1_f1 >= 0.15 and val_N1_recall >= 0.12; then max(val_macro_f1, val_kappa, val_N1_f1, val_N1_recall, val_acc)",
+        "best_ckpt_metric_name": str(train_cfg.get("best_ckpt_metric_name", "macro_f1_n1_f1_rem_f1_kappa_guarded_score")),
+        "best_ckpt_selection_rule": str(
+            train_cfg.get(
+                "best_ckpt_rule_description",
+                f"score={MACRO_N1_REM_GUARDED_SCORE_FORMULA} with val_N1_f1>=0.30 and val_N1_recall>=0.25; fallback=top3_selection_score_state_averaging",
+            )
+        ),
         "touched_active_files": ACTIVE_TOUCHED_FILES,
         "forbidden_old_checkpoint_reuse": True,
     }
@@ -535,6 +553,59 @@ def _default_recipe_for_preset(preset: str) -> str:
     return "legacy_preset"
 
 
+def _apply_context_pico_train_time_strategy(
+    cfg: dict,
+    *,
+    enable_drw: bool,
+    enable_ema: bool,
+    enable_new_selection: bool,
+    enable_tc: bool,
+) -> dict:
+    cfg = _apply_training_preset(cfg, "context_pico")
+    cfg.setdefault("loss", {})
+    cfg.setdefault("train", {})
+    loss_cfg = cfg["loss"]
+    train_cfg = cfg["train"]
+
+    loss_cfg["name"] = "ldam_drw" if enable_drw else "ldam"
+    loss_cfg["ldam_max_margin"] = 0.35
+    loss_cfg["ldam_scale"] = 18.0
+    loss_cfg["drw_start_ratio"] = 0.5
+    loss_cfg["drw_weight_strategy"] = "effective_num"
+    loss_cfg["use_class_weights"] = False
+
+    train_cfg["ema_enable"] = bool(enable_ema)
+    train_cfg["ema_decay"] = 0.999
+    train_cfg["ema_use_for_eval"] = bool(enable_ema)
+    train_cfg["ema_strategy"] = "ema"
+    train_cfg["best_ckpt_rule"] = MACRO_N1_REM_GUARDED_CKPT_RULE if enable_new_selection else "legacy_lexicographic"
+    train_cfg["best_ckpt_metric_name"] = (
+        "macro_f1_n1_f1_rem_f1_kappa_guarded_score"
+        if enable_new_selection
+        else "val_macro_f1_then_kappa_then_n1_f1_then_n1_recall"
+    )
+    train_cfg["best_ckpt_rule_description"] = (
+        f"score={MACRO_N1_REM_GUARDED_SCORE_FORMULA} with val_N1_f1>=0.30 and val_N1_recall>=0.25; fallback=top3_selection_score_state_averaging"
+        if enable_new_selection
+        else "eligible if val_N1_f1 >= 0.15 and val_N1_recall >= 0.12; then max(val_macro_f1, val_kappa, val_N1_f1, val_N1_recall, val_acc)"
+    )
+    train_cfg["best_ckpt_macro_f1_weight"] = 0.60
+    train_cfg["best_ckpt_n1_f1_weight"] = 0.20
+    train_cfg["best_ckpt_kappa_weight"] = 0.10
+    train_cfg["best_ckpt_rem_f1_weight"] = 0.10 if enable_new_selection else 0.0
+    train_cfg["best_ckpt_n1_f1_floor"] = 0.30 if enable_new_selection else 0.15
+    train_cfg["best_ckpt_n1_recall_floor"] = 0.25 if enable_new_selection else 0.12
+    train_cfg["best_ckpt_fallback_topk"] = 3 if enable_new_selection else 0
+
+    train_cfg["temporal_consistency_enable"] = bool(enable_tc)
+    train_cfg["temporal_consistency_weight"] = 0.02 if enable_tc else 0.0
+    train_cfg["temporal_consistency_temperature"] = 1.0
+    train_cfg["temporal_consistency_mode"] = "stochastic_forward"
+    train_cfg["tc_zero_guard_epochs"] = 2
+    train_cfg["tc_zero_guard_tol"] = 1e-8
+    return cfg
+
+
 def _apply_baseline_locked_defaults(cfg: dict) -> dict:
     cfg = _apply_training_preset(cfg, "plus_full")
     cfg.setdefault("model", {})
@@ -646,18 +717,64 @@ def _apply_training_recipe(cfg: dict, preset: str, recipe: str) -> dict:
         cfg["train"]["temporal_consistency_enable"] = False
         cfg["train"]["temporal_consistency_weight"] = 0.0
         cfg["train"]["temporal_consistency_temperature"] = 1.0
+        cfg["train"]["temporal_consistency_mode"] = "step_logits"
         if recipe_name == CONTEXT_PICO_RECIPE:
             return cfg
         if recipe_name == CONTEXT_PICO_LDAM_RECIPE:
-            cfg["loss"]["name"] = "ldam"
-            cfg["loss"]["ldam_max_margin"] = 0.35
-            cfg["loss"]["ldam_scale"] = 18.0
+            cfg = _apply_context_pico_train_time_strategy(
+                cfg,
+                enable_drw=True,
+                enable_ema=True,
+                enable_new_selection=True,
+                enable_tc=False,
+            )
+            cfg["train"]["recipe_name"] = recipe_name
             return cfg
         if recipe_name == CONTEXT_PICO_TC_RECIPE:
             cfg["loss"]["name"] = "cb_focal"
             cfg["train"]["temporal_consistency_enable"] = True
             cfg["train"]["temporal_consistency_weight"] = 0.03
             cfg["train"]["temporal_consistency_temperature"] = 1.0
+            return cfg
+        if recipe_name == CONTEXT_PICO_LDAM_DRW_RECIPE:
+            cfg = _apply_context_pico_train_time_strategy(
+                cfg,
+                enable_drw=True,
+                enable_ema=False,
+                enable_new_selection=False,
+                enable_tc=False,
+            )
+            cfg["train"]["recipe_name"] = recipe_name
+            return cfg
+        if recipe_name == CONTEXT_PICO_LDAM_DRW_EMA_RECIPE:
+            cfg = _apply_context_pico_train_time_strategy(
+                cfg,
+                enable_drw=True,
+                enable_ema=True,
+                enable_new_selection=False,
+                enable_tc=False,
+            )
+            cfg["train"]["recipe_name"] = recipe_name
+            return cfg
+        if recipe_name == CONTEXT_PICO_LDAM_DRW_EMA_SELECT_RECIPE:
+            cfg = _apply_context_pico_train_time_strategy(
+                cfg,
+                enable_drw=True,
+                enable_ema=True,
+                enable_new_selection=True,
+                enable_tc=False,
+            )
+            cfg["train"]["recipe_name"] = recipe_name
+            return cfg
+        if recipe_name == CONTEXT_PICO_TRAIN_TIME_OPT_RECIPE:
+            cfg = _apply_context_pico_train_time_strategy(
+                cfg,
+                enable_drw=True,
+                enable_ema=True,
+                enable_new_selection=True,
+                enable_tc=True,
+            )
+            cfg["train"]["recipe_name"] = recipe_name
             return cfg
         raise ValueError(f"recipe {recipe_name} is not compatible with preset={preset_name}")
 
@@ -785,7 +902,7 @@ def _drw_active(loss_name: str, current_epoch: int | None, total_epochs: int | N
         return False
     if current_epoch is None or total_epochs is None:
         return False
-    switch_epoch = max(1, int(round(float(total_epochs) * float(start_ratio))))
+    switch_epoch = max(2, int(np.floor(float(total_epochs) * float(start_ratio))) + 1)
     return int(current_epoch) >= int(switch_epoch)
 
 
@@ -802,6 +919,8 @@ def _build_main_loss(
     loss_name = str(loss_cfg.get("name", "ce")).lower().strip() or "ce"
     class_counts = torch.tensor(np.bincount(labels, minlength=num_classes), dtype=torch.float32)
     class_prior = compute_class_prior(labels, num_classes=num_classes)
+    drw_start_ratio = float(loss_cfg.get("drw_start_ratio", 0.5))
+    drw_switch_epoch = None if total_epochs is None else max(2, int(np.floor(float(total_epochs) * drw_start_ratio)) + 1)
 
     if "use_class_weights" in loss_cfg:
         use_class_weights = bool(_to_bool(loss_cfg.get("use_class_weights", False)))
@@ -809,7 +928,8 @@ def _build_main_loss(
         use_class_weights = False if sampler_name == "weighted" else False
 
     class_weights = None
-    if use_class_weights or _drw_active(loss_name, current_epoch=current_epoch, total_epochs=total_epochs, start_ratio=float(loss_cfg.get("drw_start_ratio", 0.5))):
+    drw_active = _drw_active(loss_name, current_epoch=current_epoch, total_epochs=total_epochs, start_ratio=drw_start_ratio)
+    if use_class_weights or drw_active:
         class_weights = compute_class_weights(
             labels,
             num_classes=num_classes,
@@ -837,17 +957,22 @@ def _build_main_loss(
         tau=float(loss_cfg.get("tau", 0.0)),
     )
     summary["sampler"] = sampler_name
-    summary["drw_active"] = bool(_drw_active(loss_name, current_epoch=current_epoch, total_epochs=total_epochs, start_ratio=float(loss_cfg.get("drw_start_ratio", 0.5))))
+    summary["drw_active"] = bool(drw_active)
     summary["use_class_weights"] = bool(use_class_weights or summary["drw_active"])
     summary["active_loss_class"] = type(loss_fn).__name__
     summary["current_epoch"] = None if current_epoch is None else int(current_epoch)
+    summary["drw_switch_epoch"] = None if drw_switch_epoch is None else int(drw_switch_epoch)
+    summary["current_loss_schedule"] = (
+        "ldam_drw_reweight" if summary["drw_active"] else ("ldam_drw_warmup" if loss_name == "ldam_drw" else loss_name)
+    )
     if loss_name == "ldam":
         summary["ldam_max_margin"] = float(loss_cfg.get("ldam_max_margin", 0.35))
         summary["ldam_scale"] = float(loss_cfg.get("ldam_scale", 20.0))
     if loss_name == "ldam_drw":
         summary["ldam_max_margin"] = float(loss_cfg.get("ldam_max_margin", 0.35))
         summary["ldam_scale"] = float(loss_cfg.get("ldam_scale", 20.0))
-        summary["drw_start_ratio"] = float(loss_cfg.get("drw_start_ratio", 0.5))
+        summary["drw_start_ratio"] = float(drw_start_ratio)
+        summary["drw_weight_strategy"] = str(loss_cfg.get("drw_weight_strategy", loss_cfg.get("class_weight_strategy", "effective_num")))
     return loss_fn, summary
 
 
@@ -1573,6 +1698,130 @@ def _update_curve_difference_report(change_proof_dir: Path, split_idx: int, log_
     save_json(report_path, report)
 
 
+def _clone_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().clone()
+        for key, value in state_dict.items()
+    }
+
+
+def _average_state_dicts(state_dicts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not state_dicts:
+        raise ValueError("state_dicts must not be empty")
+    averaged = {}
+    first = state_dicts[0]
+    for key, value in first.items():
+        if not torch.is_tensor(value):
+            averaged[key] = value
+            continue
+        if not torch.is_floating_point(value):
+            averaged[key] = value.detach().clone()
+            continue
+        stacked = torch.stack([state[key].detach().to(dtype=value.dtype) for state in state_dicts], dim=0)
+        averaged[key] = stacked.mean(dim=0)
+    return averaged
+
+
+def _with_temporary_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]):
+    backup = _clone_state_dict(model.state_dict())
+    model.load_state_dict(state_dict, strict=True)
+    return backup
+
+
+def _current_best_ckpt_decision(
+    *,
+    rule_name: str,
+    val_macro_f1: float,
+    val_kappa: float,
+    val_n1_f1: float,
+    val_n1_recall: float,
+    val_rem_f1: float,
+    val_acc: float,
+    macro_f1_weight: float,
+    n1_f1_weight: float,
+    kappa_weight: float,
+    rem_f1_weight: float,
+    n1_floor: float,
+    n1_recall_floor: float,
+) -> dict[str, object]:
+    eligible = bool(float(val_n1_f1) >= float(n1_floor) and float(val_n1_recall) >= float(n1_recall_floor))
+    gate_failures: list[str] = []
+    if float(val_n1_f1) < float(n1_floor):
+        gate_failures.append("val_N1_f1_below_floor")
+    if float(val_n1_recall) < float(n1_recall_floor):
+        gate_failures.append("val_N1_recall_below_floor")
+    if str(rule_name).lower().strip() == MACRO_N1_REM_GUARDED_CKPT_RULE:
+        score_components = {
+            "val_macro_f1": float(macro_f1_weight) * float(val_macro_f1),
+            "val_N1_f1": float(n1_f1_weight) * float(val_n1_f1),
+            "val_kappa": float(kappa_weight) * float(val_kappa),
+            "val_REM_f1": float(rem_f1_weight) * float(val_rem_f1),
+        }
+        score = (
+            score_components["val_macro_f1"]
+            + score_components["val_N1_f1"]
+            + score_components["val_kappa"]
+            + score_components["val_REM_f1"]
+        )
+        sort_key = (
+            int(eligible),
+            float(score),
+            float(val_macro_f1),
+            float(val_n1_f1),
+            float(val_rem_f1),
+            float(val_kappa),
+            float(val_acc),
+        )
+        score_formula = MACRO_N1_REM_GUARDED_SCORE_FORMULA
+    else:
+        score_components = {
+            "val_macro_f1": float(val_macro_f1),
+            "val_kappa": float(val_kappa),
+            "val_N1_f1": float(val_n1_f1),
+            "val_N1_recall": float(val_n1_recall),
+            "val_acc": float(val_acc),
+        }
+        score = float(val_macro_f1)
+        sort_key = (
+            int(eligible),
+            float(val_macro_f1),
+            float(val_kappa),
+            float(val_n1_f1),
+            float(val_n1_recall),
+            float(val_acc),
+        )
+        score_formula = "legacy_lexicographic"
+    return {
+        "eligible": bool(eligible),
+        "score": float(score),
+        "sort_key": sort_key,
+        "score_formula": str(score_formula),
+        "score_components": score_components,
+        "gate_failures": gate_failures,
+    }
+
+
+def _compress_drw_schedule(epoch_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    segments: list[dict[str, object]] = []
+    for row in epoch_rows:
+        current = {
+            "epoch_start": int(row["epoch"]),
+            "epoch_end": int(row["epoch"]),
+            "whether_drw_enabled": bool(row.get("whether_drw_enabled", False)),
+            "class_weights": list(row.get("class_weights") or []),
+            "current_loss_schedule": str(row.get("current_loss_schedule", "")),
+        }
+        if segments and (
+            segments[-1]["whether_drw_enabled"] == current["whether_drw_enabled"]
+            and segments[-1]["current_loss_schedule"] == current["current_loss_schedule"]
+            and segments[-1]["class_weights"] == current["class_weights"]
+        ):
+            segments[-1]["epoch_end"] = current["epoch_end"]
+            continue
+        segments.append(current)
+    return segments
+
+
 def _build_boundary_soft_targets(
     targets: torch.Tensor,
     prev_labels: torch.Tensor | None,
@@ -1641,6 +1890,8 @@ def _compute_loss(
     temporal_consistency_enable: bool = False,
     temporal_consistency_weight: float = 0.0,
     temporal_consistency_temperature: float = 1.0,
+    temporal_consistency_mode: str = "step_logits",
+    temporal_reference_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     logits = outputs["main"] if isinstance(outputs, dict) else outputs
     cls_loss = loss_fn(logits, targets)
@@ -1672,18 +1923,29 @@ def _compute_loss(
     if (
         bool(temporal_consistency_enable)
         and float(temporal_consistency_weight) > 0.0
-        and isinstance(outputs, dict)
-        and isinstance(outputs.get("step_logits"), torch.Tensor)
     ):
-        tc_loss = temporal_consistency_kl_loss(
-            outputs["step_logits"],
-            logits,
-            temperature=float(temporal_consistency_temperature),
-            detach_target=True,
-        )
-        tc_term = float(temporal_consistency_weight) * tc_loss
-        total = total + tc_term
-        stats["tc_loss"] = float(tc_term.detach().item())
+        tc_mode = str(temporal_consistency_mode).lower().strip() or "step_logits"
+        tc_loss = None
+        if tc_mode == "stochastic_forward" and isinstance(temporal_reference_logits, torch.Tensor):
+            tc_loss = logits_consistency_kl_loss(
+                logits,
+                temporal_reference_logits,
+                temperature=float(temporal_consistency_temperature),
+                detach_target=True,
+            )
+            stats["tc_mode"] = 1.0
+        elif isinstance(outputs, dict) and isinstance(outputs.get("step_logits"), torch.Tensor):
+            tc_loss = temporal_consistency_kl_loss(
+                outputs["step_logits"],
+                logits,
+                temperature=float(temporal_consistency_temperature),
+                detach_target=True,
+            )
+            stats["tc_mode"] = 0.0
+        if tc_loss is not None:
+            tc_term = float(temporal_consistency_weight) * tc_loss
+            total = total + tc_term
+            stats["tc_loss"] = float(tc_term.detach().item())
     if isinstance(outputs, dict):
         if isinstance(outputs.get("spike_l1"), torch.Tensor):
             spike_reg = float(lambda_s) * outputs["spike_l1"]
@@ -1816,6 +2078,9 @@ def _train_one_split(
         train_entries = _limit_entries_for_smoke(train_entries, num_classes=num_classes, per_class=smoke_train_per_class)
         val_entries = _limit_entries_for_smoke(val_entries, num_classes=num_classes, per_class=smoke_eval_per_class)
         test_entries = _limit_entries_for_smoke(test_entries, num_classes=num_classes, per_class=smoke_eval_per_class)
+    planned_epochs = int(cfg.get("epochs", 12))
+    if smoke_mode:
+        planned_epochs = min(planned_epochs, max(2, int(train_cfg.get("smoke_epochs", 3))))
 
     model_name = _canonical_model_name(model_name)
     model, model_hparams = _build_model(cfg=cfg, model_name=model_name, num_classes=num_classes, subset=subset)
@@ -1863,7 +2128,7 @@ def _train_one_split(
         sampler_name=sampler_name,
         device=device,
         current_epoch=1,
-        total_epochs=int(cfg.get("epochs", 12)),
+        total_epochs=int(planned_epochs),
     )
     sampler_power = float(train_cfg.get("sampler_balance_power", 1.0))
     boundary_sampling_boost = float(train_cfg.get("boundary_sampling_boost", 1.0))
@@ -1930,13 +2195,16 @@ def _train_one_split(
     ema_enable = bool(_to_bool(train_cfg.get("ema_enable", False)))
     ema_decay = float(train_cfg.get("ema_decay", 0.999))
     ema_use_for_eval = bool(_to_bool(train_cfg.get("ema_use_for_eval", False))) and ema_enable
+    ema_strategy = str(train_cfg.get("ema_strategy", "ema")).lower().strip() or "ema"
     boundary_soft_label_enable = bool(_to_bool(train_cfg.get("boundary_soft_label_enable", False)))
     boundary_soft_label_weight = float(train_cfg.get("boundary_soft_label_weight", 0.0))
     boundary_soft_primary_weight = float(train_cfg.get("boundary_soft_primary_weight", 0.85))
     boundary_soft_neighbor_weight = float(train_cfg.get("boundary_soft_neighbor_weight", 0.15))
-    temporal_consistency_enable = bool(_to_bool(train_cfg.get("temporal_consistency_enable", False)))
+    temporal_consistency_requested = bool(_to_bool(train_cfg.get("temporal_consistency_enable", False)))
+    temporal_consistency_enable = bool(temporal_consistency_requested)
     temporal_consistency_weight = float(train_cfg.get("temporal_consistency_weight", 0.0))
     temporal_consistency_temperature = float(train_cfg.get("temporal_consistency_temperature", 1.0))
+    temporal_consistency_mode = str(train_cfg.get("temporal_consistency_mode", "step_logits")).lower().strip() or "step_logits"
     input_mixstyle_enable = bool(_to_bool(train_cfg.get("input_mixstyle_enable", False)))
     input_mixstyle_p = float(train_cfg.get("input_mixstyle_p", 0.0))
     input_mixstyle_alpha = float(train_cfg.get("input_mixstyle_alpha", 0.3))
@@ -1954,29 +2222,44 @@ def _train_one_split(
         loss_fn=loss_fn,
         train_cfg=train_cfg,
     )
-    print(
-        "train: "
-        f"active_model_class={type(model).__name__} "
-        f"active_loss_class={loss_summary.get('active_loss_class', type(loss_fn).__name__)} "
-        f"temporal_consistency_enable={bool(temporal_consistency_enable)} "
-        f"learnable_tau_enable={bool(_to_bool(train_cfg.get('learnable_tau', False)))} "
-        f"learnable_threshold_enable={learnable_threshold_enabled} "
-        f"lr={float(cfg.get('lr', 1e-3)):.6f} "
-        f"loss_tau={float(cfg.get('loss', {}).get('tau', 0.0)):.3f} "
-        f"threshold_param_names={threshold_param_names}"
-    )
-
-    epochs = int(cfg.get("epochs", 12))
-    if bool(_to_bool(train_cfg.get("smoke", False))):
-        epochs = min(epochs, max(2, int(train_cfg.get("smoke_epochs", 3))))
+    epochs = int(planned_epochs)
     patience = int(cfg.get("early_stop_patience", 4))
     min_epochs = int(cfg.get("min_epochs", 3))
     n1_label_idx = labels.index("N1") if "N1" in labels else 1
     rem_label_idx = labels.index("REM") if "REM" in labels else rem_label
+    best_ckpt_rule = str(train_cfg.get("best_ckpt_rule", "legacy_lexicographic")).lower().strip() or "legacy_lexicographic"
+    best_ckpt_metric_name = str(train_cfg.get("best_ckpt_metric_name", "val_macro_f1_then_kappa_then_n1_f1_then_n1_recall"))
+    best_ckpt_rule_description = str(
+        train_cfg.get(
+            "best_ckpt_rule_description",
+            "eligible if val_N1_f1 >= floor and val_N1_recall >= floor; then max(val_macro_f1, val_kappa, val_N1_f1, val_N1_recall, val_acc)",
+        )
+    )
+    best_ckpt_macro_f1_weight = float(train_cfg.get("best_ckpt_macro_f1_weight", 0.60))
+    best_ckpt_n1_f1_weight = float(train_cfg.get("best_ckpt_n1_f1_weight", 0.20))
+    best_ckpt_kappa_weight = float(train_cfg.get("best_ckpt_kappa_weight", 0.10))
+    best_ckpt_rem_f1_weight = float(train_cfg.get("best_ckpt_rem_f1_weight", 0.0))
     best_ckpt_n1_floor = float(train_cfg.get("best_ckpt_n1_f1_floor", 0.15))
     best_ckpt_n1_recall_floor = float(train_cfg.get("best_ckpt_n1_recall_floor", 0.12))
+    best_ckpt_fallback_topk = int(train_cfg.get("best_ckpt_fallback_topk", 0))
     tc_zero_guard_epochs = int(train_cfg.get("tc_zero_guard_epochs", 2))
     tc_zero_guard_tol = float(train_cfg.get("tc_zero_guard_tol", 1e-8))
+    drw_switch_epoch = int(loss_summary.get("drw_switch_epoch", 0) or 0)
+    early_stop_guard_epoch = max(min_epochs, int(drw_switch_epoch + 2 if drw_switch_epoch > 0 else min_epochs))
+    print(
+        "train: "
+        f"active_model_class={type(model).__name__} "
+        f"active_loss_class={loss_summary.get('active_loss_class', type(loss_fn).__name__)} "
+        f"temporal_consistency_enable={bool(temporal_consistency_requested)} "
+        f"learnable_tau_enable={bool(_to_bool(train_cfg.get('learnable_tau', False)))} "
+        f"learnable_threshold_enable={learnable_threshold_enabled} "
+        f"best_ckpt_rule={str(train_cfg.get('best_ckpt_rule', 'legacy_lexicographic'))} "
+        f"drw_switch_epoch={int(drw_switch_epoch) if drw_switch_epoch > 0 else 'off'} "
+        f"early_stop_guard_epoch={int(early_stop_guard_epoch)} "
+        f"lr={float(cfg.get('lr', 1e-3)):.6f} "
+        f"loss_tau={float(cfg.get('loss', {}).get('tau', 0.0)):.3f} "
+        f"threshold_param_names={threshold_param_names}"
+    )
 
     collapse_cfg = train_cfg.get("collapse_protection", {})
     collapse_enable = bool(collapse_cfg.get("enable", True))
@@ -2009,17 +2292,23 @@ def _train_one_split(
         save_json(audit_dir / "spike_activity_split0.json", {"batches": spike_rows})
 
     best_metric = -1.0
-    best_ckpt_key_value = (-1, -1.0, -1.0, -1.0, -1.0, -1.0)
+    best_ckpt_key_value = (-1, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0)
     best_state = None
     best_epoch = -1
     best_val_snapshot: dict[str, float] = {}
+    best_selection_snapshot: dict[str, object] = {}
     no_improve = 0
     epoch_detail_rows: list[dict[str, object]] = []
+    selection_trace_rows: list[dict[str, object]] = []
+    topk_macro_candidates: list[dict[str, object]] = []
     tc_epoch_history: list[float] = []
     protector = CollapseProtector(trigger_ratio=collapse_trigger_ratio, patience_epochs=collapse_patience, min_zero_classes=2)
     prior_correction_enabled = False
     ema = ModelEMA(model, decay=ema_decay) if ema_enable else None
+    ema_update_count = 0
     parameter_update_written = False
+    tc_auto_disabled_epoch = None
+    tc_nonzero_epoch_count = 0
     tracked_named_parameters = dict(model.named_parameters())
     tracked_parameter_before = {
         name: tracked_named_parameters[name].detach().clone()
@@ -2092,6 +2381,15 @@ def _train_one_split(
             if mixed_precision and device.type == "cuda":
                 with _amp_autocast(device, enabled=bool(mixed_precision)):
                     outputs = model(x)
+                    temporal_reference_logits = None
+                    if bool(temporal_consistency_enable) and temporal_consistency_mode == "stochastic_forward":
+                        if hasattr(model, "reset_state"):
+                            model.reset_state()
+                        with torch.no_grad():
+                            ref_outputs = model(x)
+                        ref_logits = ref_outputs["main"] if isinstance(ref_outputs, dict) else ref_outputs
+                        if isinstance(ref_logits, torch.Tensor):
+                            temporal_reference_logits = ref_logits.detach()
                     loss, loss_stats = _compute_loss(
                         outputs,
                         loss_fn,
@@ -2121,6 +2419,8 @@ def _train_one_split(
                         temporal_consistency_enable=temporal_consistency_enable,
                         temporal_consistency_weight=temporal_consistency_weight,
                         temporal_consistency_temperature=temporal_consistency_temperature,
+                        temporal_consistency_mode=temporal_consistency_mode,
+                        temporal_reference_logits=temporal_reference_logits,
                     )
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -2163,8 +2463,18 @@ def _train_one_split(
                     parameter_update_written = True
                 if ema is not None:
                     ema.update(model)
+                    ema_update_count += 1
             else:
                 outputs = model(x)
+                temporal_reference_logits = None
+                if bool(temporal_consistency_enable) and temporal_consistency_mode == "stochastic_forward":
+                    if hasattr(model, "reset_state"):
+                        model.reset_state()
+                    with torch.no_grad():
+                        ref_outputs = model(x)
+                    ref_logits = ref_outputs["main"] if isinstance(ref_outputs, dict) else ref_outputs
+                    if isinstance(ref_logits, torch.Tensor):
+                        temporal_reference_logits = ref_logits.detach()
                 loss, loss_stats = _compute_loss(
                     outputs,
                     loss_fn,
@@ -2194,6 +2504,8 @@ def _train_one_split(
                     temporal_consistency_enable=temporal_consistency_enable,
                     temporal_consistency_weight=temporal_consistency_weight,
                     temporal_consistency_temperature=temporal_consistency_temperature,
+                    temporal_consistency_mode=temporal_consistency_mode,
+                    temporal_reference_logits=temporal_reference_logits,
                 )
                 loss.backward()
                 if learnable_threshold_enabled and (not parameter_update_written):
@@ -2234,6 +2546,7 @@ def _train_one_split(
                     parameter_update_written = True
                 if ema is not None:
                     ema.update(model)
+                    ema_update_count += 1
             logits_for_acc = _main_logits(outputs)
             train_correct += int(torch.eq(torch.argmax(logits_for_acc.detach(), dim=1), y).sum().item())
             total_loss += float(loss.detach().item()) * int(y.size(0))
@@ -2273,24 +2586,64 @@ def _train_one_split(
         pred_counts = np.bincount(y_pred, minlength=num_classes).astype(np.int64)
         pred_ratio = (pred_counts / max(1, int(pred_counts.sum()))).tolist()
         val_pred_ratio_n1 = float(pred_ratio[n1_label_idx]) if n1_label_idx < len(pred_ratio) else 0.0
-        current_ckpt_key = _best_ckpt_key(
+        current_selection = _current_best_ckpt_decision(
+            rule_name=best_ckpt_rule,
             val_macro_f1=val_macro_f1,
             val_kappa=val_kappa,
             val_n1_f1=val_n1_f1,
             val_n1_recall=val_n1_recall,
+            val_rem_f1=val_rem_f1,
             val_acc=val_acc,
+            macro_f1_weight=best_ckpt_macro_f1_weight,
+            n1_f1_weight=best_ckpt_n1_f1_weight,
+            kappa_weight=best_ckpt_kappa_weight,
+            rem_f1_weight=best_ckpt_rem_f1_weight,
             n1_floor=best_ckpt_n1_floor,
             n1_recall_floor=best_ckpt_n1_recall_floor,
         )
-        current_metric = val_macro_f1
+        current_ckpt_key = tuple(current_selection["sort_key"])
+        current_metric = float(current_selection["score"])
         current_tc_loss = float(mean_loss_components.get("tc_loss", 0.0))
+        tc_enabled_this_epoch = bool(temporal_consistency_enable)
         tc_epoch_history.append(current_tc_loss)
+        if not loss_is_effectively_zero(current_tc_loss, tol=tc_zero_guard_tol):
+            tc_nonzero_epoch_count += 1
         if bool(temporal_consistency_enable) and has_consecutive_effective_zeros(
             tc_epoch_history[-tc_zero_guard_epochs:],
             streak=tc_zero_guard_epochs,
             tol=tc_zero_guard_tol,
         ):
-            raise RuntimeError("temporal consistency 未真正接入训练主链")
+            tc_auto_disabled_epoch = int(epoch)
+            temporal_consistency_enable = False
+            temporal_consistency_weight = 0.0
+            print(f"split={split_idx} epoch={epoch} temporal consistency auto-disabled due to sustained zero tc_loss")
+
+        candidate_state_dict = (
+            ema.state_dict() if ema is not None and ema_use_for_eval else _clone_state_dict(model.state_dict())
+        )
+        if best_ckpt_fallback_topk > 0:
+            topk_macro_candidates.append(
+                {
+                    "epoch": int(epoch),
+                    "val_macro_f1": float(val_macro_f1),
+                    "val_n1_f1": float(val_n1_f1),
+                    "val_rem_f1": float(val_rem_f1),
+                    "selection_score": float(current_metric),
+                    "state_dict": candidate_state_dict,
+                    "best_ckpt_eligible": bool(current_selection["eligible"]),
+                }
+            )
+            topk_macro_candidates.sort(
+                key=lambda item: (
+                    float(item["selection_score"]),
+                    float(item["val_macro_f1"]),
+                    float(item["val_n1_f1"]),
+                    float(item["val_rem_f1"]),
+                    -int(item["epoch"]),
+                ),
+                reverse=True,
+            )
+            topk_macro_candidates = topk_macro_candidates[: max(1, best_ckpt_fallback_topk)]
 
         collapse_fix = 0
         if collapse_enable and protector.update(pred_ratio=pred_ratio, pred_counts=pred_counts):
@@ -2340,10 +2693,18 @@ def _train_one_split(
                 "val_n1_f1": val_n1_f1,
                 "val_n1_recall": val_n1_recall,
                 "val_rem_f1": val_rem_f1,
+                "N1_precision": val_n1_precision,
+                "N1_f1": val_n1_f1,
+                "N1_recall": val_n1_recall,
+                "REM_f1": val_rem_f1,
                 "val_per_class": per_class_payload["rows"],
                 "val_pred_ratio": pred_ratio,
                 "pred_ratio": pred_ratio,
-                "best_ckpt_eligible": bool(current_ckpt_key[0]),
+                "best_ckpt_eligible": bool(current_selection["eligible"]),
+                "best_ckpt_rule": str(best_ckpt_rule),
+                "best_ckpt_score": float(current_metric),
+                "best_ckpt_score_formula": str(current_selection.get("score_formula", "")),
+                "best_ckpt_gate_failures": list(current_selection.get("gate_failures", [])),
                 "n1_suppression": bool(val_pred_ratio_n1 < 0.03),
                 "collapse_fix": collapse_fix,
                 "lr": float(optimizer.param_groups[0]["lr"]),
@@ -2351,10 +2712,32 @@ def _train_one_split(
                 "active_loss_class": loss_summary.get("active_loss_class", type(loss_fn).__name__),
                 "loss_use_class_weights": loss_summary["use_class_weights"],
                 "drw_active": bool(loss_summary.get("drw_active", False)),
+                "class_weights": loss_summary.get("class_weights"),
+                "current_loss_schedule": str(loss_summary.get("current_loss_schedule", "")),
+                "whether_drw_enabled": bool(loss_summary.get("drw_active", False)),
+                "whether_ema_or_swa_enabled": bool(ema_enable),
                 "ema_used_for_eval": bool(ema_use_for_eval),
                 "boundary_soft_label_enable": bool(boundary_soft_label_enable),
-                "temporal_consistency_enable": bool(temporal_consistency_enable),
+                "temporal_consistency_enable": bool(tc_enabled_this_epoch),
+                "temporal_consistency_mode": str(temporal_consistency_mode),
             },
+        )
+        selection_trace_rows.append(
+            {
+                "epoch": int(epoch),
+                "score": float(current_metric),
+                "eligible": bool(current_selection["eligible"]),
+                "val_macro_f1": float(val_macro_f1),
+                "val_n1_f1": float(val_n1_f1),
+                "val_n1_recall": float(val_n1_recall),
+                "val_rem_f1": float(val_rem_f1),
+                "val_kappa": float(val_kappa),
+                "val_acc": float(val_acc),
+                "rule_name": str(best_ckpt_rule),
+                "score_formula": str(current_selection.get("score_formula", "")),
+                "score_components": dict(current_selection.get("score_components", {})),
+                "gate_failures": list(current_selection.get("gate_failures", [])),
+            }
         )
         epoch_detail_rows.append(
             {
@@ -2365,6 +2748,14 @@ def _train_one_split(
                 "active_loss_class": str(loss_summary.get("active_loss_class", type(loss_fn).__name__)),
                 "loss_name": str(loss_summary.get("loss_name", "")),
                 "drw_active": bool(loss_summary.get("drw_active", False)),
+                "whether_drw_enabled": bool(loss_summary.get("drw_active", False)),
+                "whether_ema_or_swa_enabled": bool(ema_enable),
+                "current_loss_schedule": str(loss_summary.get("current_loss_schedule", "")),
+                "class_weights": list(loss_summary.get("class_weights") or []),
+                "best_ckpt_rule": str(best_ckpt_rule),
+                "best_ckpt_score": float(current_metric),
+                "best_ckpt_score_formula": str(current_selection.get("score_formula", "")),
+                "best_ckpt_gate_failures": json.dumps(list(current_selection.get("gate_failures", [])), ensure_ascii=False),
                 "cls_loss": float(mean_loss_components.get("cls_loss", mean_loss_components.get("base_loss", 0.0))),
                 "aux_loss": float(mean_loss_components.get("aux_loss", 0.0)),
                 "tc_loss": current_tc_loss,
@@ -2377,7 +2768,7 @@ def _train_one_split(
                 "val_N1_recall": float(val_n1_recall),
                 "val_REM_f1": float(val_rem_f1),
                 "val_pred_ratio": json.dumps([float(v) for v in pred_ratio], ensure_ascii=False),
-                "best_ckpt_eligible": bool(current_ckpt_key[0]),
+                "best_ckpt_eligible": bool(current_selection["eligible"]),
                 "n1_suppression": bool(val_pred_ratio_n1 < 0.03),
             }
         )
@@ -2389,10 +2780,14 @@ def _train_one_split(
             f"train_acc={train_acc:.4f} "
             f"val_acc={val_acc:.4f} macro_f1={val_macro_f1:.4f} kappa={val_kappa:.4f} "
             f"N1_precision={val_n1_precision:.4f} N1_f1={val_n1_f1:.4f} N1_recall={val_n1_recall:.4f} REM_f1={val_rem_f1:.4f} "
-            f"pred_ratio={[round(float(p), 4) for p in pred_ratio]}"
+            f"pred_ratio={[round(float(p), 4) for p in pred_ratio]} "
+            f"current_loss_schedule={str(loss_summary.get('current_loss_schedule', ''))} "
+            f"whether_drw_enabled={bool(loss_summary.get('drw_active', False))} "
+            f"whether_ema_or_swa_enabled={bool(ema_enable)} "
+            f"best_ckpt_score={float(current_metric):.4f}"
         )
 
-        if current_ckpt_key > best_ckpt_key_value:
+        if bool(current_selection["eligible"]) and current_ckpt_key > best_ckpt_key_value:
             best_ckpt_key_value = current_ckpt_key
             best_metric = current_metric
             best_epoch = int(epoch)
@@ -2405,10 +2800,19 @@ def _train_one_split(
                 "val_N1_recall": float(val_n1_recall),
                 "val_REM_f1": float(val_rem_f1),
             }
+            best_selection_snapshot = {
+                "score": float(current_metric),
+                "rule_name": str(best_ckpt_rule),
+                "eligible": bool(current_selection["eligible"]),
+                "epoch": int(epoch),
+                "score_formula": str(current_selection.get("score_formula", "")),
+                "score_components": dict(current_selection.get("score_components", {})),
+                "gate_failures": list(current_selection.get("gate_failures", [])),
+            }
             no_improve = 0
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = _clone_state_dict(candidate_state_dict)
             model_hparams = model.get_hparams() if hasattr(model, "get_hparams") else model_hparams
-            ema_backup = ema.apply_to(model) if ema is not None and ema_use_for_eval else None
+            model_backup = _with_temporary_state_dict(model, candidate_state_dict)
             try:
                 save_checkpoint(
                     split_dir / "best.ckpt",
@@ -2426,8 +2830,7 @@ def _train_one_split(
                     trial_id=0,
                 )
             finally:
-                if ema_backup is not None:
-                    ema.restore(model, ema_backup)
+                model.load_state_dict(model_backup, strict=True)
             (split_dir / "best_hparams.json").write_text(
                 json.dumps(
                     {
@@ -2437,9 +2840,12 @@ def _train_one_split(
                         "num_classes": int(num_classes),
                         "best_epoch": int(best_epoch),
                         "best_val_snapshot": best_val_snapshot,
+                        "best_selection_snapshot": best_selection_snapshot,
                         "best_ckpt_n1_f1_floor": float(best_ckpt_n1_floor),
                         "best_ckpt_n1_recall_floor": float(best_ckpt_n1_recall_floor),
                         "best_ckpt_key": list(best_ckpt_key_value),
+                        "best_ckpt_rule": str(best_ckpt_rule),
+                        "best_ckpt_rule_description": str(best_ckpt_rule_description),
                         "ema_enable": bool(ema_enable),
                         "ema_use_for_eval": bool(ema_use_for_eval),
                     },
@@ -2450,7 +2856,7 @@ def _train_one_split(
             )
         else:
             no_improve += 1
-            if epoch >= min_epochs and no_improve >= patience:
+            if epoch >= early_stop_guard_epoch and no_improve >= patience:
                 break
 
         if split_idx == 0 and epoch == 1:
@@ -2470,6 +2876,204 @@ def _train_one_split(
             writer = csv.DictWriter(fp, fieldnames=list(epoch_detail_rows[0].keys()))
             writer.writeheader()
             writer.writerows(epoch_detail_rows)
+
+    fallback_used = False
+    fallback_payload: dict[str, object] = {}
+    if not (split_dir / "best.ckpt").exists() and best_ckpt_fallback_topk > 0 and topk_macro_candidates:
+        fallback_used = True
+        fallback_candidates = topk_macro_candidates[: max(1, min(len(topk_macro_candidates), best_ckpt_fallback_topk))]
+        averaged_state = _average_state_dicts([item["state_dict"] for item in fallback_candidates])
+        best_state = _clone_state_dict(averaged_state)
+        best_epoch = int(fallback_candidates[0]["epoch"])
+        best_metric = float(np.mean([float(item["selection_score"]) for item in fallback_candidates]))
+        epoch_row_map = {int(row["epoch"]): row for row in epoch_detail_rows}
+        best_epoch_row = epoch_row_map.get(best_epoch, {})
+        best_val_snapshot = {
+            "val_acc": float(best_epoch_row.get("val_acc", float("nan"))),
+            "val_macro_f1": float(best_epoch_row.get("val_macro_f1", float("nan"))),
+            "val_kappa": float(best_epoch_row.get("val_kappa", float("nan"))),
+            "val_N1_precision": float(best_epoch_row.get("val_N1_precision", float("nan"))),
+            "val_N1_f1": float(best_epoch_row.get("val_N1_f1", float("nan"))),
+            "val_N1_recall": float(best_epoch_row.get("val_N1_recall", float("nan"))),
+            "val_REM_f1": float(best_epoch_row.get("val_REM_f1", float("nan"))),
+        }
+        best_selection_snapshot = {
+            "score": float(best_metric),
+            "rule_name": "fallback_topk_selection_score_average",
+            "eligible": False,
+            "epoch": int(best_epoch),
+            "score_formula": "mean(topk_selection_scores)",
+        }
+        model_backup = _with_temporary_state_dict(model, averaged_state)
+        try:
+            save_checkpoint(
+                split_dir / "best.ckpt",
+                model,
+                optimizer,
+                scaler if mixed_precision else None,
+                cfg,
+                best_epoch,
+                best_metric,
+                model_name=model_name,
+                model_hparams=model_hparams,
+                task=cfg.get("task", "sleep_edf_5class"),
+                num_classes=num_classes,
+                split_id=split_idx,
+                trial_id=0,
+            )
+        finally:
+            model.load_state_dict(model_backup, strict=True)
+        fallback_payload = {
+            "fallback_used": True,
+            "fallback_name": "topk_selection_score_state_averaging",
+            "topk": int(len(fallback_candidates)),
+            "candidate_epochs": [int(item["epoch"]) for item in fallback_candidates],
+            "candidate_selection_scores": [float(item["selection_score"]) for item in fallback_candidates],
+            "candidate_val_macro_f1": [float(item["val_macro_f1"]) for item in fallback_candidates],
+        }
+        (split_dir / "best_hparams.json").write_text(
+            json.dumps(
+                {
+                    "model_name": model_name,
+                    "model_hparams": model_hparams,
+                    "task": cfg.get("task", "sleep_edf_5class"),
+                    "num_classes": int(num_classes),
+                    "best_epoch": int(best_epoch),
+                    "best_val_snapshot": best_val_snapshot,
+                    "best_selection_snapshot": best_selection_snapshot,
+                    "best_ckpt_n1_f1_floor": float(best_ckpt_n1_floor),
+                    "best_ckpt_n1_recall_floor": float(best_ckpt_n1_recall_floor),
+                    "best_ckpt_key": list(best_ckpt_key_value),
+                    "best_ckpt_rule": str(best_ckpt_rule),
+                    "best_ckpt_rule_description": str(best_ckpt_rule_description),
+                    "ema_enable": bool(ema_enable),
+                    "ema_use_for_eval": bool(ema_use_for_eval),
+                    "fallback": fallback_payload,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    save_json(
+        change_proof_dir / "ldam_drw_schedule.json",
+        {
+            "split": int(split_idx),
+            "loss_name": str(loss_summary.get("loss_name", "")),
+            "drw_start_ratio": float(cfg.get("loss", {}).get("drw_start_ratio", 0.5)),
+            "drw_switch_epoch": None if drw_switch_epoch <= 0 else int(drw_switch_epoch),
+            "early_stop_guard_epoch": int(early_stop_guard_epoch),
+            "drw_schedule": _compress_drw_schedule(epoch_detail_rows),
+            "delta": {
+                "baseline_locked": {
+                    "active_model_class": "ContextPicoSNN",
+                    "active_loss_class": "LDAMLoss",
+                    "whether_drw_enabled": False,
+                },
+                "candidate": {
+                    "active_model_class": "ContextPicoSNN",
+                    "active_loss_class": str(loss_summary.get("active_loss_class", type(loss_fn).__name__)),
+                    "whether_drw_enabled": bool(any(bool(row.get("whether_drw_enabled", False)) for row in epoch_detail_rows)),
+                },
+            },
+        },
+    )
+    save_json(
+        change_proof_dir / "ema_or_swa_report.json",
+        {
+            "split": int(split_idx),
+            "strategy": "EMA" if ema_strategy == "ema" else str(ema_strategy).upper(),
+            "enabled": bool(ema_enable),
+            "used_for_eval": bool(ema_use_for_eval),
+            "decay": float(ema_decay),
+            "update_count": int(ema.num_updates if ema is not None else ema_update_count),
+            "averaged_weights_maintained": bool((ema.num_updates if ema is not None else ema_update_count) > 0),
+            "averaged_checkpoint_path": str(split_dir / "best.ckpt"),
+            "averaged_checkpoint_exported": bool((split_dir / "best.ckpt").exists() and ema_enable and ema_use_for_eval),
+            "delta": {
+                "baseline_locked": {"whether_ema_or_swa_enabled": False},
+                "candidate": {"whether_ema_or_swa_enabled": bool(ema_enable)},
+            },
+        },
+    )
+    save_json(
+        change_proof_dir / "ckpt_selection_rule.json",
+        {
+            "split": int(split_idx),
+            "rule_name": str(best_ckpt_rule),
+            "metric_name": str(best_ckpt_metric_name),
+            "rule_description": str(best_ckpt_rule_description),
+            "score_formula": MACRO_N1_REM_GUARDED_SCORE_FORMULA if best_ckpt_rule == MACRO_N1_REM_GUARDED_CKPT_RULE else "legacy_lexicographic",
+            "score_weights": {
+                "val_macro_f1": float(best_ckpt_macro_f1_weight),
+                "val_N1_f1": float(best_ckpt_n1_f1_weight),
+                "val_kappa": float(best_ckpt_kappa_weight),
+                "val_REM_f1": float(best_ckpt_rem_f1_weight),
+            },
+            "hard_thresholds": {
+                "val_N1_f1": float(best_ckpt_n1_floor),
+                "val_N1_recall": float(best_ckpt_n1_recall_floor),
+            },
+            "fallback_policy": {
+                "topk_selection_score_state_averaging": int(best_ckpt_fallback_topk),
+                **fallback_payload,
+            },
+            "selected_checkpoint": {
+                "best_epoch": int(best_epoch),
+                "best_selection_snapshot": best_selection_snapshot,
+            },
+            "early_stop_guard_epoch": int(early_stop_guard_epoch),
+            "epochs": selection_trace_rows,
+            "delta": {
+                "baseline_locked": {
+                    "rule_name": "legacy_lexicographic",
+                    "val_N1_f1_floor": 0.15,
+                    "val_N1_recall_floor": 0.12,
+                },
+                "candidate": {
+                    "rule_name": str(best_ckpt_rule),
+                    "val_N1_f1_floor": float(best_ckpt_n1_floor),
+                    "val_N1_recall_floor": float(best_ckpt_n1_recall_floor),
+                },
+            },
+        },
+    )
+    save_json(
+        change_proof_dir / "temporal_consistency_truth.json",
+        {
+            "split": int(split_idx),
+            "requested": bool(temporal_consistency_requested),
+            "enabled_during_training": bool(any(bool(row.get("temporal_consistency_enable", False)) for row in epoch_detail_rows)),
+            "final_enabled": bool(temporal_consistency_enable),
+            "status": (
+                "enabled_with_nonzero_loss"
+                if tc_nonzero_epoch_count > 0
+                else ("removed_from_active_mainline" if not temporal_consistency_requested else "requested_but_zero_or_disabled")
+            ),
+            "mode": str(temporal_consistency_mode),
+            "weight": float(train_cfg.get("temporal_consistency_weight", 0.0)),
+            "temperature": float(temporal_consistency_temperature),
+            "auto_disabled_epoch": None if tc_auto_disabled_epoch is None else int(tc_auto_disabled_epoch),
+            "nonzero_epoch_count": int(tc_nonzero_epoch_count),
+            "epochs": [
+                {
+                    "epoch": int(row["epoch"]),
+                    "temporal_consistency_enable": bool(row.get("temporal_consistency_enable", False)),
+                    "tc_loss": float(row.get("tc_loss", 0.0)),
+                }
+                for row in epoch_detail_rows
+            ],
+            "delta": {
+                "baseline_locked": {"temporal_consistency_enable": False, "tc_loss": 0.0},
+                "candidate": {
+                    "temporal_consistency_enable": bool(temporal_consistency_requested),
+                    "observed_nonzero_tc_loss": bool(tc_nonzero_epoch_count > 0),
+                    "removed_from_active_mainline": bool((not temporal_consistency_requested) and tc_nonzero_epoch_count == 0),
+                },
+            },
+        },
+    )
 
     if not (split_dir / "best.ckpt").exists():
         n1_guard_payload = {
@@ -2634,11 +3238,14 @@ def _train_one_split(
         "ema_enable": bool(ema_enable),
         "ema_decay": float(ema_decay),
         "ema_use_for_eval": bool(ema_use_for_eval),
+        "ema_strategy": str(ema_strategy),
         "boundary_soft_label_enable": bool(boundary_soft_label_enable),
         "boundary_soft_label_weight": float(boundary_soft_label_weight),
-        "temporal_consistency_enable": bool(temporal_consistency_enable),
-        "temporal_consistency_weight": float(temporal_consistency_weight),
+        "temporal_consistency_enable": bool(temporal_consistency_requested),
+        "temporal_consistency_final_enable": bool(temporal_consistency_enable),
+        "temporal_consistency_weight": float(train_cfg.get("temporal_consistency_weight", 0.0)),
         "temporal_consistency_temperature": float(temporal_consistency_temperature),
+        "temporal_consistency_mode": str(temporal_consistency_mode),
         "sequence_context_enabled": bool(context_len > 1),
         "context_len": int(context_len),
         "boundary_sampling_boost": float(boundary_sampling_boost),
@@ -2653,10 +3260,19 @@ def _train_one_split(
         "learnable_threshold_param_names": threshold_param_names,
         "best_epoch": int(best_epoch),
         "best_val_snapshot": best_val_snapshot,
-        "best_ckpt_metric_name": "val_macro_f1_then_kappa_then_n1_f1_then_n1_recall",
+        "best_selection_snapshot": best_selection_snapshot,
+        "best_ckpt_metric_name": str(best_ckpt_metric_name),
+        "best_ckpt_rule": str(best_ckpt_rule),
+        "best_ckpt_score_formula": (
+            MACRO_N1_REM_GUARDED_SCORE_FORMULA if best_ckpt_rule == MACRO_N1_REM_GUARDED_CKPT_RULE else "legacy_lexicographic"
+        ),
+        "best_ckpt_rem_f1_weight": float(best_ckpt_rem_f1_weight),
         "best_ckpt_n1_f1_floor": float(best_ckpt_n1_floor),
         "best_ckpt_n1_recall_floor": float(best_ckpt_n1_recall_floor),
-        "best_ckpt_selection_rule": "eligible if val_N1_f1 >= floor and val_N1_recall >= floor; then max(val_macro_f1, val_kappa, val_N1_f1, val_N1_recall, val_acc)",
+        "best_ckpt_fallback_topk": int(best_ckpt_fallback_topk),
+        "best_ckpt_selection_rule": str(best_ckpt_rule_description),
+        "drw_switch_epoch": None if drw_switch_epoch <= 0 else int(drw_switch_epoch),
+        "early_stop_guard_epoch": int(early_stop_guard_epoch),
     }
     (split_dir / "train_meta.json").write_text(json.dumps(split_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     _append_train_log_first_epochs_csv(change_proof_dir, split_idx=split_idx, log_path=log_path, max_epochs=3)
@@ -2682,6 +3298,8 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--smoke_epochs", type=int, default=None)
     parser.add_argument("--smoke_splits", type=int, default=None)
+    parser.add_argument("--smoke_train_per_class", type=int, default=None)
+    parser.add_argument("--smoke_eval_per_class", type=int, default=None)
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument(
         "--preset",
@@ -2734,6 +3352,10 @@ def main() -> None:
         cfg["train"]["smoke_epochs"] = int(args.smoke_epochs)
     if args.smoke_splits is not None:
         cfg["train"]["smoke_splits"] = int(args.smoke_splits)
+    if args.smoke_train_per_class is not None:
+        cfg["train"]["smoke_train_per_class"] = int(args.smoke_train_per_class)
+    if args.smoke_eval_per_class is not None:
+        cfg["train"]["smoke_eval_per_class"] = int(args.smoke_eval_per_class)
     if args.epochs is not None:
         cfg["epochs"] = int(args.epochs)
     if args.patience is not None:

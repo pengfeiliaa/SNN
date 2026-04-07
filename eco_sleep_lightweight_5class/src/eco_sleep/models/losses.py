@@ -405,6 +405,33 @@ def temporal_consistency_kl_loss(
     return loss.mean() * (temp * temp)
 
 
+def logits_consistency_kl_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float = 1.0,
+    detach_target: bool = True,
+) -> torch.Tensor:
+    if student_logits.ndim != 2:
+        raise RuntimeError(
+            f"logits_consistency_kl_loss 闇€瑕?student_logits=[B,C]锛屾敹鍒?shape={tuple(student_logits.shape)}銆?"
+        )
+    if teacher_logits.ndim != 2:
+        raise RuntimeError(
+            f"logits_consistency_kl_loss 闇€瑕?teacher_logits=[B,C]锛屾敹鍒?shape={tuple(teacher_logits.shape)}銆?"
+        )
+    if tuple(student_logits.shape) != tuple(teacher_logits.shape):
+        raise RuntimeError(
+            "logits_consistency_kl_loss 闇€瑕?student_logits 涓?teacher_logits 褰㈢姸瀹屽叏涓€鑷淬€?"
+        )
+    temp = float(max(temperature, 1e-4))
+    student_log_prob = F.log_softmax(student_logits / temp, dim=-1)
+    target_prob = F.softmax(teacher_logits / temp, dim=-1)
+    if detach_target:
+        target_prob = target_prob.detach()
+    loss = F.kl_div(student_log_prob, target_prob, reduction="none").sum(dim=-1)
+    return loss.mean() * (temp * temp)
+
+
 def build_loss(
     loss_type: str,
     class_weights: Optional[torch.Tensor] = None,

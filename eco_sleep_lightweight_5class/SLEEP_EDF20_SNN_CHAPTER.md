@@ -227,3 +227,38 @@ python .\scripts\eval_sleep_edf.py --run_dir E:\papercode\eco_sleep_lightweight_
 
 - `E:\papercode\eco_sleep_lightweight_5class\runs\20260405_context_pico_v1_ldam_guarded_5fold\change_proof\`
 - `E:\papercode\eco_sleep_lightweight_5class\runs\20260405_context_pico_v1_ldam_guarded_5fold\eval\`
+
+## 5.11 Current Incremental Lightweight Recipe
+
+当前锁定基线：
+
+- `E:\papercode\eco_sleep_lightweight_5class\runs\20260405_162343_sleep_edf_context_pico`
+- model=`ContextPicoSNN`
+- recipe=`context_pico_v1_ldam`
+
+当前继续优化但不增加推理复杂度的 recipe：
+
+- recipe=`context_pico_v1_ldam`
+- backbone remains `ContextPicoSNN`
+- params / MACs / `context_len` / `t_steps` must stay at the locked baseline level
+- train-time loss schedule=`LDAM -> LDAM-DRW`
+- weight averaging=`EMA`
+- best checkpoint score=`0.60 * val_macro_f1 + 0.20 * val_N1_f1 + 0.10 * val_kappa + 0.10 * val_REM_f1`
+- hard gates=`val_N1_f1 >= 0.30` and `val_N1_recall >= 0.25`
+- fallback=`top-3 selection-score checkpoint averaging`
+- temporal consistency=`removed from the active mainline until non-zero tc_loss is proven`
+- calibration=`validation only temperature scaling + 5D class bias, with raw fallback when outputs/metrics do not actually change`
+
+short smoke verification:
+
+```powershell
+python .\scripts\train_sleep_edf.py --allow_cpu --preset context_pico --recipe context_pico_v1_ldam --smoke --smoke_epochs 8 --smoke_splits 1 --smoke_train_per_class 8 --smoke_eval_per_class 4 --only_splits 0 --run_dir runs\20260407_context_pico_v1_ldam_smoke
+python .\scripts\eval_sleep_edf.py --run_dir E:\papercode\eco_sleep_lightweight_5class\runs\20260407_context_pico_v1_ldam_smoke --only_splits 0 --postprocess auto --smoke --smoke_eval_per_class 4
+```
+
+完整 5-fold 由用户自行执行：
+
+```powershell
+python .\scripts\train_sleep_edf.py --allow_cpu --preset context_pico --recipe context_pico_v1_ldam --run_dir runs\20260407_context_pico_v1_ldam_5fold
+python .\scripts\eval_sleep_edf.py --run_dir E:\papercode\eco_sleep_lightweight_5class\runs\20260407_context_pico_v1_ldam_5fold --postprocess auto
+```

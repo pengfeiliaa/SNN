@@ -40,7 +40,7 @@ from eco_sleep.utils.sleep_stats import build_sleep_stats_table
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BASELINE_RUN_DIR = (REPO_ROOT / "runs" / "20260401_171526_sleep_edf").resolve()
+BASELINE_RUN_DIR = (REPO_ROOT / "runs" / "20260405_162343_sleep_edf_context_pico").resolve()
 BASELINE_SELECTED_METRICS = {
     0: {"result_tag": "smoothed", "accuracy": 0.7154561017363659, "macro_f1": 0.664538395512947, "kappa": 0.6282419664993963},
     1: {"result_tag": "raw", "accuracy": 0.7410256410256411, "macro_f1": 0.6770970435274625, "kappa": 0.6428224073332747},
@@ -53,6 +53,7 @@ BASELINE_MEAN_METRICS = {
     "mean_macro_f1": 0.6843748313645832,
     "mean_kappa": 0.6592088612437255,
 }
+CALIBRATION_SELECTION_SCORE_FORMULA = "0.60*macro_f1+0.20*N1_f1+0.10*kappa+0.10*REM_f1"
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,18 @@ def _entry_counts(entries: List[EpochEntry], num_classes: int) -> np.ndarray:
     if not entries:
         return np.zeros(num_classes, dtype=np.int64)
     return np.bincount([int(entry.label) for entry in entries], minlength=num_classes).astype(np.int64)
+
+
+def _limit_entries_for_smoke(entries: List[EpochEntry], num_classes: int, per_class: int) -> List[EpochEntry]:
+    if per_class <= 0 or not entries:
+        return list(entries)
+    buckets: Dict[int, List[EpochEntry]] = {c: [] for c in range(num_classes)}
+    for entry in entries:
+        buckets[int(entry.label)].append(entry)
+    limited: List[EpochEntry] = []
+    for c in range(num_classes):
+        limited.extend(buckets[c][:per_class])
+    return limited if limited else list(entries[: max(1, min(len(entries), per_class * num_classes))])
 
 
 def _json_counts(counts: np.ndarray, labels: List[str]) -> str:
@@ -523,36 +536,38 @@ def _derive_class_bias(y_true: np.ndarray, y_prob: np.ndarray, num_classes: int)
 
 def _apply_light_postprocess(
     raw_result: Dict[str, np.ndarray],
-    smooth_result: Dict[str, np.ndarray] | None,
     temperature: float,
     bias_scale: float,
     bias_vector: np.ndarray,
-    smooth_mix: float,
 ) -> Dict[str, np.ndarray]:
     raw_logits = np.asarray(raw_result["logits"], dtype=np.float32)
-    mixed_logits = raw_logits.copy()
-    if smooth_result is not None and float(smooth_mix) > 0.0:
-        smooth_logits = np.asarray(smooth_result["logits"], dtype=np.float32)
-        mixed_logits = (1.0 - float(smooth_mix)) * raw_logits + float(smooth_mix) * smooth_logits
-    adjusted = mixed_logits / float(max(temperature, 1e-6))
+    adjusted = raw_logits / float(max(temperature, 1e-6))
     adjusted = adjusted + float(bias_scale) * np.asarray(bias_vector, dtype=np.float32).reshape(1, -1)
     return _result_from_logits(raw_result, adjusted)
 
 
+def _calibration_selection_score(metrics: Dict[str, float], n1_idx: int = 1, rem_idx: int = 4) -> float:
+    return (
+        0.60 * float(metrics.get("macro_f1", 0.0))
+        + 0.20 * float(metrics.get(f"class_{n1_idx}_f1", 0.0))
+        + 0.10 * float(metrics.get("kappa", 0.0))
+        + 0.10 * float(metrics.get(f"class_{rem_idx}_f1", 0.0))
+    )
+
+
 def _search_light_postprocess(
     raw_result: Dict[str, np.ndarray],
-    smooth_result: Dict[str, np.ndarray] | None,
     num_classes: int,
     wake_label: int,
     rem_label: int,
+    n1_idx: int = 1,
+    rem_idx: int = 4,
 ) -> Dict[str, Any]:
     raw_metrics = _evaluate_metrics(raw_result["y_true"], raw_result["y_pred"], raw_result["y_prob"], num_classes, wake_label, rem_label)
     bias_vector = _derive_class_bias(raw_result["y_true"], raw_result["y_prob"], num_classes)
-    temperature_candidates = [0.95, 1.0, 1.05]
-    bias_scale_candidates = [0.0, 0.5, 1.0]
-    smooth_mix_candidates = [0.0]
-    if smooth_result is not None:
-        smooth_mix_candidates.extend([0.05, 0.10])
+    raw_score = _calibration_selection_score(raw_metrics, n1_idx=n1_idx, rem_idx=rem_idx)
+    temperature_candidates = [0.90, 0.95, 1.0, 1.05, 1.10]
+    bias_scale_candidates = [0.0, 0.25, 0.50, 0.75, 1.0]
 
     best_result = raw_result
     best_metrics = raw_metrics
@@ -560,63 +575,58 @@ def _search_light_postprocess(
         "temperature": 1.0,
         "bias_scale": 0.0,
         "bias_vector": bias_vector.tolist(),
-        "smooth_mix": 0.0,
+        "score": float(raw_score),
         "selected_on_validation": False,
     }
     search_rows: List[Dict[str, float]] = []
 
     for temperature in temperature_candidates:
         for bias_scale in bias_scale_candidates:
-            for smooth_mix in smooth_mix_candidates:
-                if abs(float(temperature) - 1.0) < 1e-8 and abs(float(bias_scale)) < 1e-8 and abs(float(smooth_mix)) < 1e-8:
-                    continue
-                candidate = _apply_light_postprocess(
-                    raw_result=raw_result,
-                    smooth_result=smooth_result,
-                    temperature=float(temperature),
-                    bias_scale=float(bias_scale),
-                    bias_vector=bias_vector,
-                    smooth_mix=float(smooth_mix),
+            if abs(float(temperature) - 1.0) < 1e-8 and abs(float(bias_scale)) < 1e-8:
+                continue
+            candidate = _apply_light_postprocess(
+                raw_result=raw_result,
+                temperature=float(temperature),
+                bias_scale=float(bias_scale),
+                bias_vector=bias_vector,
+            )
+            metrics = _evaluate_metrics(
+                candidate["y_true"],
+                candidate["y_pred"],
+                candidate["y_prob"],
+                num_classes,
+                wake_label,
+                rem_label,
+            )
+            candidate_score = _calibration_selection_score(metrics, n1_idx=n1_idx, rem_idx=rem_idx)
+            row = {
+                "temperature": float(temperature),
+                "bias_scale": float(bias_scale),
+                "macro_f1": float(metrics["macro_f1"]),
+                "accuracy": float(metrics["accuracy"]),
+                "kappa": float(metrics["kappa"]),
+                "N1_f1": float(metrics.get(f"class_{n1_idx}_f1", 0.0)),
+                "REM_f1": float(metrics.get(f"class_{rem_idx}_f1", 0.0)),
+                "score": float(candidate_score),
+            }
+            search_rows.append(row)
+            better = (
+                candidate_score > float(best_params.get("score", raw_score)) + 1e-9
+                or (
+                    abs(candidate_score - float(best_params.get("score", raw_score))) <= 1e-9
+                    and metrics["macro_f1"] > best_metrics["macro_f1"] + 1e-9
                 )
-                metrics = _evaluate_metrics(
-                    candidate["y_true"],
-                    candidate["y_pred"],
-                    candidate["y_prob"],
-                    num_classes,
-                    wake_label,
-                    rem_label,
-                )
-                row = {
+            )
+            if better:
+                best_result = candidate
+                best_metrics = metrics
+                best_params = {
                     "temperature": float(temperature),
                     "bias_scale": float(bias_scale),
-                    "smooth_mix": float(smooth_mix),
-                    "macro_f1": float(metrics["macro_f1"]),
-                    "accuracy": float(metrics["accuracy"]),
-                    "kappa": float(metrics["kappa"]),
+                    "bias_vector": bias_vector.tolist(),
+                    "score": float(candidate_score),
+                    "selected_on_validation": True,
                 }
-                search_rows.append(row)
-                better = (
-                    metrics["macro_f1"] > best_metrics["macro_f1"] + 1e-9
-                    or (
-                        abs(metrics["macro_f1"] - best_metrics["macro_f1"]) <= 1e-9
-                        and metrics["accuracy"] > best_metrics["accuracy"] + 1e-9
-                    )
-                    or (
-                        abs(metrics["macro_f1"] - best_metrics["macro_f1"]) <= 1e-9
-                        and abs(metrics["accuracy"] - best_metrics["accuracy"]) <= 1e-9
-                        and metrics["kappa"] > best_metrics["kappa"] + 1e-9
-                    )
-                )
-                if better:
-                    best_result = candidate
-                    best_metrics = metrics
-                    best_params = {
-                        "temperature": float(temperature),
-                        "bias_scale": float(bias_scale),
-                        "bias_vector": bias_vector.tolist(),
-                        "smooth_mix": float(smooth_mix),
-                        "selected_on_validation": True,
-                    }
 
     return {
         "raw_metrics": raw_metrics,
@@ -624,6 +634,51 @@ def _search_light_postprocess(
         "best_result": best_result,
         "best_params": best_params,
         "search_rows": search_rows,
+    }
+
+
+def _compare_calibration_effect(
+    raw_result: Dict[str, np.ndarray],
+    calibrated_result: Dict[str, np.ndarray],
+    raw_metrics: Dict[str, float],
+    calibrated_metrics: Dict[str, float],
+    *,
+    n1_idx: int,
+    rem_idx: int,
+) -> Dict[str, Any]:
+    metric_keys = [
+        "accuracy",
+        "macro_f1",
+        "kappa",
+        f"class_{n1_idx}_f1",
+        f"class_{n1_idx}_recall",
+        f"class_{rem_idx}_f1",
+    ]
+    metric_delta = {
+        key: float(calibrated_metrics.get(key, 0.0) - raw_metrics.get(key, 0.0))
+        for key in metric_keys
+    }
+    changed_predictions = bool(
+        not np.array_equal(
+            np.asarray(raw_result["y_pred"], dtype=np.int64),
+            np.asarray(calibrated_result["y_pred"], dtype=np.int64),
+        )
+    )
+    changed_metrics = bool(any(abs(float(delta)) > 1e-9 for delta in metric_delta.values()))
+    changed_probabilities = bool(
+        not np.allclose(
+            np.asarray(raw_result["y_prob"], dtype=np.float32),
+            np.asarray(calibrated_result["y_prob"], dtype=np.float32),
+            atol=1e-7,
+            rtol=1e-6,
+        )
+    )
+    return {
+        "calibration_changed_outputs": bool(changed_predictions or changed_metrics),
+        "calibration_changed_predictions": bool(changed_predictions),
+        "calibration_changed_metrics": bool(changed_metrics),
+        "calibration_changed_probabilities": bool(changed_probabilities),
+        "metric_delta": metric_delta,
     }
 
 
@@ -953,6 +1008,8 @@ def _preferred_result_tag(df: pd.DataFrame) -> str:
     tags = set(df.get("result_tag", pd.Series(dtype=str)).astype(str).tolist())
     if "selected" in tags:
         return "selected"
+    if "calibrated" in tags:
+        return "calibrated"
     if "smoothed" in tags:
         return "smoothed"
     return "raw"
@@ -1009,12 +1066,33 @@ def _load_eval_profile(run_dir: Path) -> Dict[str, Any]:
 
 def _write_baseline_result_check(run_dir: Path, profile: Dict[str, Any]) -> Dict[str, Any]:
     change_proof_dir = ensure_dir(run_dir / "change_proof")
+    baseline_summary_path = BASELINE_RUN_DIR / "eval" / "summary_metrics.csv"
+    baseline_summary_df = pd.read_csv(baseline_summary_path) if baseline_summary_path.exists() else pd.DataFrame()
+    baseline_per_fold: dict[int, dict[str, float | str]] = {}
+    baseline_mean_metrics = {"mean_acc": float("nan"), "mean_macro_f1": float("nan"), "mean_kappa": float("nan")}
+    if not baseline_summary_df.empty:
+        baseline_numeric = baseline_summary_df[pd.to_numeric(baseline_summary_df["split"], errors="coerce").notna()].copy()
+        if "recipe_name" in baseline_numeric.columns:
+            baseline_numeric = baseline_numeric[baseline_numeric["recipe_name"].astype(str).str.len() > 0].copy()
+        if not baseline_numeric.empty:
+            baseline_numeric["split"] = baseline_numeric["split"].astype(int)
+            for _, row in baseline_numeric.iterrows():
+                baseline_per_fold[int(row["split"])] = {
+                    "result_tag": str(row.get("result_tag", "")),
+                    "accuracy": float(row.get("test_acc", row.get("accuracy", float("nan")))),
+                    "macro_f1": float(row.get("test_macro_f1", row.get("macro_f1", float("nan")))),
+                    "kappa": float(row.get("test_kappa", row.get("kappa", float("nan")))),
+                }
+        baseline_mean_metrics["mean_acc"] = float(pd.to_numeric(baseline_numeric.get("test_acc", baseline_numeric.get("accuracy")), errors="coerce").mean())
+        baseline_mean_metrics["mean_macro_f1"] = float(pd.to_numeric(baseline_numeric.get("test_macro_f1", baseline_numeric.get("macro_f1")), errors="coerce").mean())
+        baseline_mean_metrics["mean_kappa"] = float(pd.to_numeric(baseline_numeric.get("test_kappa", baseline_numeric.get("kappa")), errors="coerce").mean())
+
     split_payload = []
     exact_match_full = True
     seen_splits = set()
     for row in sorted(profile.get("per_fold_metrics", []), key=lambda item: int(item.get("split", -1))):
         split_idx = int(row["split"])
-        baseline_row = BASELINE_SELECTED_METRICS.get(split_idx)
+        baseline_row = baseline_per_fold.get(split_idx)
         if baseline_row is None:
             continue
         seen_splits.add(split_idx)
@@ -1042,7 +1120,7 @@ def _write_baseline_result_check(run_dir: Path, profile: Dict[str, Any]) -> Dict
             }
         )
 
-    full_5fold_present = seen_splits == set(BASELINE_SELECTED_METRICS.keys())
+    full_5fold_present = bool(baseline_per_fold) and seen_splits == set(baseline_per_fold.keys())
     status = "ok"
     reason = "new_result_differs_from_baseline"
     if full_5fold_present and exact_match_full:
@@ -1053,13 +1131,14 @@ def _write_baseline_result_check(run_dir: Path, profile: Dict[str, Any]) -> Dict
         "status": status,
         "reason": reason,
         "baseline_run_dir": str(BASELINE_RUN_DIR),
+        "baseline_summary_path": str(baseline_summary_path),
         "new_run_dir": str(run_dir),
         "mean_acc": float(profile.get("mean_acc", float("nan"))),
         "mean_macro_f1": float(profile.get("mean_macro_f1", float("nan"))),
         "mean_kappa": float(profile.get("mean_kappa", float("nan"))),
-        "delta_mean_acc": float(profile.get("mean_acc", float("nan"))) - float(BASELINE_MEAN_METRICS["mean_acc"]),
-        "delta_mean_macro_f1": float(profile.get("mean_macro_f1", float("nan"))) - float(BASELINE_MEAN_METRICS["mean_macro_f1"]),
-        "delta_mean_kappa": float(profile.get("mean_kappa", float("nan"))) - float(BASELINE_MEAN_METRICS["mean_kappa"]),
+        "delta_mean_acc": float(profile.get("mean_acc", float("nan"))) - float(baseline_mean_metrics["mean_acc"]),
+        "delta_mean_macro_f1": float(profile.get("mean_macro_f1", float("nan"))) - float(baseline_mean_metrics["mean_macro_f1"]),
+        "delta_mean_kappa": float(profile.get("mean_kappa", float("nan"))) - float(baseline_mean_metrics["mean_kappa"]),
         "splits": split_payload,
     }
     save_json(change_proof_dir / "baseline_result_check.json", payload)
@@ -1201,7 +1280,7 @@ def _sample_input_from_loader(dataloader) -> torch.Tensor | None:
 
 def _infer_timesteps(model_hparams: dict[str, Any]) -> int:
     if "t_steps" in model_hparams:
-        return int(model_hparams.get("t_steps", 0)) + int(model_hparams.get("context_len", 1))
+        return int(model_hparams.get("t_steps", 0))
     if "window_size" in model_hparams:
         window = max(1, int(model_hparams.get("window_size", 40)))
         return int(3000 // window)
@@ -1251,24 +1330,41 @@ def _write_change_proof_outputs(run_dir: Path, summary_df: pd.DataFrame, labels:
         except Exception:
             model_hparams = {}
 
-    baseline_summary = pd.read_csv(BASELINE_RUN_DIR / "eval" / "summary_metrics.csv")
-    baseline_primary = baseline_summary[
-        (baseline_summary["split"].astype(str) == "mean") & (baseline_summary["result_tag"].astype(str) == "selected")
-    ]
-    if baseline_primary.empty:
-        baseline_primary = baseline_summary[
-            (baseline_summary["split"].astype(str) == "mean") & (baseline_summary["result_tag"].astype(str) == "raw")
-        ]
-    baseline_params = float(baseline_primary["total_params"].iloc[0]) if not baseline_primary.empty else float("nan")
-    baseline_macs = float(baseline_primary["estimated_MACs"].iloc[0]) if not baseline_primary.empty else float("nan")
-    baseline_latency = (
-        float(baseline_primary["inference_latency_ms"].iloc[0]) if not baseline_primary.empty else float("nan")
-    )
+    baseline_detail_path = BASELINE_RUN_DIR / "eval" / "summary_metrics_detailed.csv"
+    baseline_detail = pd.read_csv(baseline_detail_path) if baseline_detail_path.exists() else pd.DataFrame()
+    baseline_primary = pd.DataFrame()
+    baseline_source = "baseline_eval_summary_metrics_detailed"
+    if not baseline_detail.empty:
+        baseline_valid = baseline_detail[pd.to_numeric(baseline_detail["split"], errors="coerce").notna()].copy()
+        baseline_primary = baseline_valid[baseline_valid["result_tag"].astype(str) == "selected"].copy()
+        if baseline_primary.empty:
+            baseline_primary = baseline_valid[baseline_valid["result_tag"].astype(str) == "raw"].copy()
+    baseline_params = float(pd.to_numeric(baseline_primary.get("total_params"), errors="coerce").mean()) if not baseline_primary.empty else float("nan")
+    baseline_macs = float(pd.to_numeric(baseline_primary.get("estimated_MACs"), errors="coerce").mean()) if not baseline_primary.empty else float("nan")
+    baseline_latency = float(pd.to_numeric(baseline_primary.get("inference_latency_ms"), errors="coerce").mean()) if not baseline_primary.empty else float("nan")
+    baseline_model_hparams = {}
+    if not baseline_primary.empty and "model_hparams" in baseline_primary.columns:
+        try:
+            baseline_model_hparams = json.loads(str(baseline_primary.iloc[0]["model_hparams"]))
+        except Exception:
+            baseline_model_hparams = {}
+    baseline_timesteps_t = int(_infer_timesteps(baseline_model_hparams)) if baseline_model_hparams else int(model_hparams.get("t_steps", 0))
+    baseline_context_len = int(baseline_model_hparams.get("context_len", model_hparams.get("context_len", 1))) if baseline_model_hparams else int(model_hparams.get("context_len", 1))
 
     current_params = float(pd.to_numeric(primary_rows["total_params"], errors="coerce").mean())
     current_macs = float(pd.to_numeric(primary_rows["estimated_MACs"], errors="coerce").mean())
     current_latency = float(pd.to_numeric(primary_rows["inference_latency_ms"], errors="coerce").mean())
     timesteps_t = int(_infer_timesteps(model_hparams))
+    current_context_len = int(model_hparams.get("context_len", 1))
+
+    if pd.isna(baseline_params) or pd.isna(baseline_macs):
+        baseline_source = "active_model_code_unchanged_fallback"
+        baseline_params = current_params if pd.isna(baseline_params) else baseline_params
+        baseline_macs = current_macs if pd.isna(baseline_macs) else baseline_macs
+        if not baseline_model_hparams:
+            baseline_model_hparams = dict(model_hparams)
+        baseline_timesteps_t = int(_infer_timesteps(baseline_model_hparams))
+        baseline_context_len = int(baseline_model_hparams.get("context_len", current_context_len))
 
     params_ratio = float(current_params / baseline_params) if baseline_params and baseline_params > 0 else float("nan")
     macs_ratio = float(current_macs / baseline_macs) if baseline_macs and baseline_macs > 0 else float("nan")
@@ -1286,12 +1382,15 @@ def _write_change_proof_outputs(run_dir: Path, summary_df: pd.DataFrame, labels:
             "runtime_device": "cpu" if not torch.cuda.is_available() else "cuda",
         },
         "complexity_vs_current_baseline": {
+            "baseline_source": baseline_source,
             "params_ratio": params_ratio,
             "MACs_ratio": macs_ratio,
             "latency_ratio": latency_ratio,
             "baseline_params": baseline_params,
             "baseline_MACs": baseline_macs,
             "baseline_latency_ms": baseline_latency,
+            "baseline_timesteps_T": baseline_timesteps_t,
+            "baseline_context_len": baseline_context_len,
         },
         "complexity_vs_picosleepnet_target": {
             "reference": "in_repo_picosleepnet_plus_snn_baseline_proxy",
@@ -1299,10 +1398,40 @@ def _write_change_proof_outputs(run_dir: Path, summary_df: pd.DataFrame, labels:
             "MACs_ratio": macs_ratio,
         },
         "within_complexity_budget": bool(
-            (pd.isna(params_ratio) or params_ratio <= 1.2) and (pd.isna(macs_ratio) or macs_ratio <= 1.3)
+            (pd.isna(params_ratio) or params_ratio <= 1.0 + 1e-9)
+            and (pd.isna(macs_ratio) or macs_ratio <= 1.0 + 1e-9)
+            and int(timesteps_t) <= int(baseline_timesteps_t)
+            and int(current_context_len) <= int(baseline_context_len)
         ),
     }
     save_json(change_proof_dir / "complexity_report.json", complexity_report)
+    save_json(
+        change_proof_dir / "complexity_guard.json",
+        {
+            "baseline_run_dir": str(BASELINE_RUN_DIR),
+            "baseline_summary_metrics_detailed": str(baseline_detail_path),
+            "baseline_source": baseline_source,
+            "baseline": {
+                "params": float(baseline_params),
+                "MACs": float(baseline_macs),
+                "T": int(baseline_timesteps_t),
+                "context_len": int(baseline_context_len),
+            },
+            "candidate": {
+                "params": float(current_params),
+                "MACs": float(current_macs),
+                "T": int(timesteps_t),
+                "context_len": int(current_context_len),
+            },
+            "checks": {
+                "params_not_higher": bool(pd.isna(params_ratio) or params_ratio <= 1.0 + 1e-9),
+                "MACs_not_higher": bool(pd.isna(macs_ratio) or macs_ratio <= 1.0 + 1e-9),
+                "T_not_higher": bool(int(timesteps_t) <= int(baseline_timesteps_t)),
+                "context_len_not_higher": bool(int(current_context_len) <= int(baseline_context_len)),
+            },
+            "complexity_guard_passed": bool(complexity_report["within_complexity_budget"]),
+        },
+    )
 
     metric_guard = {
         "mean_acc": mean_acc,
@@ -1315,6 +1444,24 @@ def _write_change_proof_outputs(run_dir: Path, summary_df: pd.DataFrame, labels:
         "final_status": "target_reached" if (mean_acc >= 0.85 and mean_macro_f1 >= 0.80) else "below_target",
     }
     save_json(change_proof_dir / "metric_guard_report.json", metric_guard)
+    postprocess_selection_path = run_dir / "eval" / "postprocess_selection.json"
+    postprocess_payload = json.loads(postprocess_selection_path.read_text(encoding="utf-8")) if postprocess_selection_path.exists() else {"folds": []}
+    folds = list(postprocess_payload.get("folds", []))
+    save_json(
+        change_proof_dir / "calibration_report.json",
+        {
+            "calibration_type": "validation_only_temperature_scaling_plus_5d_class_bias",
+            "selection_policy": "validation_only_search_then_apply_to_test",
+            "selection_score_formula": CALIBRATION_SELECTION_SCORE_FORMULA,
+            "baseline_run_dir": str(BASELINE_RUN_DIR),
+            "selected_calibrated_folds": int(sum(1 for row in folds if str(row.get("selected_result_tag", "")) == "calibrated")),
+            "raw_fallback_folds": int(sum(1 for row in folds if str(row.get("selected_result_tag", "")) == "raw")),
+            "calibration_changed_outputs_folds": int(sum(1 for row in folds if bool(row.get("calibration_changed_outputs", False)))),
+            "calibration_changed_predictions_folds": int(sum(1 for row in folds if bool(row.get("calibration_changed_predictions", False)))),
+            "calibration_changed_metrics_folds": int(sum(1 for row in folds if bool(row.get("calibration_changed_metrics", False)))),
+            "folds": folds,
+        },
+    )
 
 
 def _append_mean_std_test_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -1579,6 +1726,8 @@ def main() -> None:
     parser.add_argument("--reference_run_dir", type=str, default=None)
     parser.add_argument("--postprocess", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--only_splits", type=str, default=None)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--smoke_eval_per_class", type=int, default=32)
     args = parser.parse_args()
 
     config_path = _resolve_repo_path(args.config)
@@ -1658,6 +1807,9 @@ def main() -> None:
             continue
         split_dir = ensure_dir(eval_root / f"split_{split_idx}")
         parts = _entries_for_split(split, all_entries)
+        if args.smoke:
+            parts["val"] = _limit_entries_for_smoke(parts["val"], num_classes=num_classes, per_class=int(args.smoke_eval_per_class))
+            parts["test"] = _limit_entries_for_smoke(parts["test"], num_classes=num_classes, per_class=int(args.smoke_eval_per_class))
         train_counts = _entry_counts(parts["train"], num_classes)
         val_counts = _entry_counts(parts["val"], num_classes)
         test_counts = _entry_counts(parts["test"], num_classes)
@@ -1758,29 +1910,41 @@ def main() -> None:
             else {}
         )
 
-        allow_transition_smoothing = bool(model_hparams.get("use_transition_matrix", model_name == "picosleepnet_plus_snn"))
         allow_postprocess = args.postprocess != "off"
-        use_transition_smoothing = args.postprocess == "on" or (
-            args.postprocess == "auto" and model_name == "picosleepnet_plus_snn" and allow_transition_smoothing
-        )
 
+        n1_idx = labels.index("N1") if "N1" in labels else 1
+        rem_idx = labels.index("REM") if "REM" in labels else (num_classes - 1)
         raw_metrics = _evaluate_metrics(raw_result["y_true"], raw_result["y_pred"], raw_result["y_prob"], num_classes, wake_label, rem_label)
-        smoothed_result = None
-        smooth_metrics = None
+        calibrated_result = None
+        calibrated_metrics = None
         selected_result = raw_result
         selected_metrics = raw_metrics
         selected_result_tag = "raw"
+        calibration_comparison: Dict[str, Any] = {
+            "calibration_changed_outputs": False,
+            "calibration_changed_predictions": False,
+            "calibration_changed_metrics": False,
+            "calibration_changed_probabilities": False,
+            "metric_delta": {},
+        }
         selection_payload: Dict[str, Any] = {
             "split": int(split_idx),
+            "evaluation_split": "test",
             "selected_result_tag": "raw",
             "raw_metrics": raw_metrics,
-            "smoothed_metrics": None,
-            "selection_reason": "postprocess_disabled",
+            "calibrated_metrics": None,
+            "selection_reason": "calibration_disabled",
+            "calibration_selection_score_formula": CALIBRATION_SELECTION_SCORE_FORMULA,
+            "calibration_changed_outputs": False,
+            "calibration_changed_predictions": False,
+            "calibration_changed_metrics": False,
+            "calibration_changed_probabilities": False,
             "postprocess_params": {
                 "temperature": 1.0,
                 "bias_scale": 0.0,
                 "bias_vector": [0.0] * num_classes,
-                "smooth_mix": 0.0,
+                "score": float(_calibration_selection_score(raw_metrics, n1_idx=n1_idx, rem_idx=rem_idx)),
+                "calibration_type": "temperature_plus_class_bias",
                 "selected_on_validation": False,
             },
         }
@@ -1794,73 +1958,78 @@ def main() -> None:
                 non_blocking=bool(pin_memory),
                 return_logits=True,
             )
-            val_smooth_result = _apply_transition_postprocess(val_raw_result, model) if use_transition_smoothing else None
             light_search = _search_light_postprocess(
                 raw_result=val_raw_result,
-                smooth_result=val_smooth_result,
                 num_classes=num_classes,
                 wake_label=wake_label,
                 rem_label=rem_label,
+                n1_idx=n1_idx,
+                rem_idx=rem_idx,
             )
             if bool(light_search["best_params"].get("selected_on_validation", False)):
-                test_transition_result = _apply_transition_postprocess(raw_result, model) if use_transition_smoothing else None
-                smoothed_result = _apply_light_postprocess(
+                calibrated_result = _apply_light_postprocess(
                     raw_result=raw_result,
-                    smooth_result=test_transition_result,
                     temperature=float(light_search["best_params"]["temperature"]),
                     bias_scale=float(light_search["best_params"]["bias_scale"]),
                     bias_vector=np.asarray(light_search["best_params"]["bias_vector"], dtype=np.float32),
-                    smooth_mix=float(light_search["best_params"]["smooth_mix"]),
                 )
-                if int(len(smoothed_result["y_true"])) != expected_test_samples:
+                if int(len(calibrated_result["y_true"])) != expected_test_samples:
                     raise RuntimeError(
-                        f"split={split_idx} sample count mismatch after smoothing: "
-                        f"predictions={len(smoothed_result['y_true'])} expected_test_entries={expected_test_samples}"
+                        f"split={split_idx} sample count mismatch after calibration: "
+                        f"predictions={len(calibrated_result['y_true'])} expected_test_entries={expected_test_samples}"
                     )
-                smooth_metrics = _evaluate_metrics(
-                    smoothed_result["y_true"],
-                    smoothed_result["y_pred"],
-                    smoothed_result["y_prob"],
+                calibrated_metrics = _evaluate_metrics(
+                    calibrated_result["y_true"],
+                    calibrated_result["y_pred"],
+                    calibrated_result["y_prob"],
                     num_classes,
                     wake_label,
                     rem_label,
                 )
-                if smooth_metrics["macro_f1"] > raw_metrics["macro_f1"] + 1e-9 or (
-                    abs(smooth_metrics["macro_f1"] - raw_metrics["macro_f1"]) <= 1e-9
-                    and smooth_metrics["accuracy"] >= raw_metrics["accuracy"] - 1e-9
-                ):
-                    selected_result = smoothed_result
-                    selected_metrics = smooth_metrics
-                    selected_result_tag = "smoothed"
-                    selection_reason = "validation_selected_and_test_not_worse"
+                calibration_comparison = _compare_calibration_effect(
+                    raw_result,
+                    calibrated_result,
+                    raw_metrics,
+                    calibrated_metrics,
+                    n1_idx=n1_idx,
+                    rem_idx=rem_idx,
+                )
+                if bool(calibration_comparison["calibration_changed_outputs"]):
+                    selected_result = calibrated_result
+                    selected_metrics = calibrated_metrics
+                    selected_result_tag = "calibrated"
+                    selection_reason = "validation_selected_and_changed_test_outputs_or_metrics"
                 else:
-                    selection_reason = "fallback_to_raw_due_to_macro_f1_or_accuracy_drop"
+                    selection_reason = "fallback_to_raw_due_to_no_test_output_or_metric_change"
             else:
-                selection_reason = "raw_kept_after_validation_search"
+                selection_reason = "raw_kept_after_validation_calibration_search"
             selection_payload = {
                 "split": int(split_idx),
+                "evaluation_split": "test",
                 "selected_result_tag": selected_result_tag,
                 "raw_metrics": raw_metrics,
-                "smoothed_metrics": smooth_metrics,
+                "calibrated_metrics": calibrated_metrics,
                 "selection_reason": selection_reason,
+                "calibration_selection_score_formula": CALIBRATION_SELECTION_SCORE_FORMULA,
+                **calibration_comparison,
                 "postprocess_params": light_search["best_params"],
                 "validation_search": light_search["search_rows"],
+                "validation_raw_metrics": light_search["raw_metrics"],
+                "validation_best_metrics": light_search["best_metrics"],
             }
-            if smoothed_result is not None:
-                _save_split_comparison(split_dir, raw_result, smoothed_result)
+            if calibrated_result is not None:
+                _save_split_comparison(split_dir, raw_result, calibrated_result)
         elif allow_postprocess:
             selection_payload["selection_reason"] = "fallback_to_raw_due_to_missing_val_split"
 
         result_map = {"raw": raw_result}
-        if smoothed_result is not None:
-            result_map["smoothed"] = smoothed_result
+        if calibrated_result is not None:
+            result_map["calibrated"] = calibrated_result
         result_map["selected"] = selected_result
         postprocess_selection_rows.append(selection_payload)
 
         for result_tag, result in result_map.items():
-            metrics = raw_metrics if result_tag == "raw" else (smooth_metrics if result_tag == "smoothed" else selected_metrics)
-            n1_idx = labels.index("N1") if "N1" in labels else 1
-            rem_idx = labels.index("REM") if "REM" in labels else (num_classes - 1)
+            metrics = raw_metrics if result_tag == "raw" else (calibrated_metrics if result_tag == "calibrated" else selected_metrics)
             _save_result_bundle(
                 split_dir,
                 split_idx,
@@ -1890,7 +2059,11 @@ def main() -> None:
                     "N1_f1": float(metrics.get(f"class_{n1_idx}_f1", np.nan)),
                     "N1_recall": float(metrics.get(f"class_{n1_idx}_recall", np.nan)),
                     "REM_f1": float(metrics.get(f"class_{rem_idx}_f1", np.nan)),
-                    "postprocess_used": bool(result_tag == "smoothed" or (result_tag == "selected" and selected_result_tag != "raw")),
+                    "evaluation_split": "test",
+                    "calibration_changed_outputs": bool(selection_payload.get("calibration_changed_outputs", False)),
+                    "calibration_changed_predictions": bool(selection_payload.get("calibration_changed_predictions", False)),
+                    "calibration_changed_metrics": bool(selection_payload.get("calibration_changed_metrics", False)),
+                    "postprocess_used": bool(result_tag == "calibrated" or (result_tag == "selected" and selected_result_tag != "raw")),
                     "total_params": float(complexity.get("total_params", np.nan)),
                     "trainable_params": float(complexity.get("trainable_params", np.nan)),
                     "estimated_MACs": float(complexity.get("estimated_MACs", np.nan)),
@@ -1912,16 +2085,17 @@ def main() -> None:
                 "val_counts": val_counts.tolist(),
                 "test_counts": test_counts.tolist(),
                 "raw_result": raw_result,
-                "smoothed_result": smoothed_result,
+                "smoothed_result": calibrated_result,
                 "selected_result": selected_result,
                 "raw_metrics": raw_metrics,
-                "smoothed_metrics": smooth_metrics,
+                "smoothed_metrics": calibrated_metrics,
                 "selected_metrics": selected_metrics,
             }
 
         primary = selected_result
         print(
             f"eval split={split_idx} tag={selected_result_tag} "
+            f"calibration_changed_outputs={bool(selection_payload.get('calibration_changed_outputs', False))} "
             f"acc={float(np.mean(primary['y_true'] == primary['y_pred'])):.4f} "
             f"macro_f1={float(f1_score(primary['y_true'], primary['y_pred'], average='macro', zero_division=0)):.4f}"
         )

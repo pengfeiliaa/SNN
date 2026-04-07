@@ -149,6 +149,7 @@ class ModelEMA:
 
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
         self.decay = float(min(max(decay, 0.0), 0.99999))
+        self.num_updates = 0
         self.shadow = {
             key: value.detach().clone()
             for key, value in model.state_dict().items()
@@ -156,6 +157,7 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        current_decay = self.decay if self.num_updates > 0 else 0.0
         current_state = model.state_dict()
         for key, value in current_state.items():
             if not torch.is_tensor(value):
@@ -165,7 +167,8 @@ class ModelEMA:
             if not torch.is_floating_point(source):
                 shadow_value.copy_(source)
                 continue
-            shadow_value.mul_(self.decay).add_(source, alpha=(1.0 - self.decay))
+            shadow_value.mul_(current_decay).add_(source, alpha=(1.0 - current_decay))
+        self.num_updates += 1
 
     def backup_model_state(self, model: nn.Module) -> dict[str, torch.Tensor]:
         return {
